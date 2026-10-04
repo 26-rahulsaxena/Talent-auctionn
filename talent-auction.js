@@ -106,14 +106,14 @@
     });
   }
 
-  function normTwists(data, twists) {
+  function normTwists(data, twists, roundList) {
     if (Array.isArray(twists)) {
-      var o = {}; data.rounds.forEach(function (r, i) { o[r.id] = twists[i]; }); return o;
+      var o = {}; (roundList || classicRounds(data)).forEach(function (r, i) { o[r.id] = twists[i]; }); return o;
     }
     return twists || {};
   }
 
-  function frictionOf(data, members, hammerTotal, stars) {
+  function frictionOf(data, members, hammerTotal, stars, budget) {
     var S = data.settings;
     var A = function (name) { return members.map(function (m) { return m.c.attrs[name]; }); };
     var maxF2 = Math.max.apply(null, [0].concat(stars.map(function (s) { return s.f2Offset; })));
@@ -132,7 +132,7 @@
           trig = ai >= r.p1 && ae < r.p2; detail = 'avg Innovation ' + ai.toFixed(1) + ', avg Execution ' + ae.toFixed(1); break;
         case 'F4':
           var ac = avg(A(ATTR.COMM_AC));
-          trig = hammerTotal > r.p1 * S.budget && ac < r.p2;
+          trig = hammerTotal > r.p1 * budget && ac < r.p2;
           detail = 'spend ₹' + round1(hammerTotal) + 'L vs ' + Math.round(r.p1 * 100) + '% of budget, avg Commercial Acumen ' + ac.toFixed(1); break;
         case 'F5':
           var cf = members.filter(function (m) { return r.functions.indexOf(m.c.function) >= 0; });
@@ -153,12 +153,25 @@
 
   function round1(x) { return Math.round(x * 10) / 10; }
 
+  /** The rounds of the classic three-round evaluation (NovaBite's three problems). */
+  function classicRounds(data) {
+    var ids = data.meta && data.meta.classicRounds;
+    return ids ? data.rounds.filter(function (r) { return ids.indexOf(r.id) >= 0; }) : data.rounds;
+  }
+
+  /** Budget for a game or an evaluation: opts.budget, else the single problem's own budget, else Settings. */
+  function budgetOf(data, opts) {
+    if (opts && opts.budget) return opts.budget;
+    if (opts && opts.rounds && opts.rounds.length === 1) { var rd = idx(data).round[opts.rounds[0]]; if (rd && rd.budget) return rd.budget; }
+    return data.settings.budget;
+  }
+
   /** The scoring engine. Pure function used for BOTH teams. */
   function scoreTeam(data, ids, prices, twistsIn, opts) {
-    var S = data.settings, I = idx(data), codes = I.codes;
-    // opts.rounds: play only these challenges (e.g. ['C2'] in a single-problem game). Default: all three.
-    var roundList = opts && opts.rounds ? data.rounds.filter(function (r) { return opts.rounds.indexOf(r.id) >= 0; }) : data.rounds;
-    var twists = normTwists(data, twistsIn);
+    var S = data.settings, I = idx(data), codes = I.codes, budget = budgetOf(data, opts);
+    // opts.rounds: play only these problems (e.g. ['C2'] in a single-problem game). Default: the classic three.
+    var roundList = opts && opts.rounds ? data.rounds.filter(function (r) { return opts.rounds.indexOf(r.id) >= 0; }) : classicRounds(data);
+    var twists = normTwists(data, twistsIn, roundList);
     var members = ids.map(function (id, i) {
       var c = I.byId[id];
       if (!c) throw new Error('Unknown candidate ' + id);
@@ -208,11 +221,11 @@
     var hammer = sum(members.map(function (m) { return m.price; }));
     var bench = sum(members.map(function (m) { return m.c.benchmark; }));
     var pd = clamp(50 + 100 * S.priceDisciplineSlope * (1 - hammer / bench), 0, 100);
-    var refRate = S.referenceChallenge / (S.referenceSpendShare * S.budget);
+    var refRate = S.referenceChallenge / (S.referenceSpendShare * budget);
     var vpr = hammer > 0 ? Math.min(100, 50 * (challenge / hammer) / refRate) : 100;
     var be = 0.5 * pd + 0.5 * vpr;
     var risk = avg(members.map(function (m) { return (m.c.attrs[ATTR.ADAPT] + m.c.attrs[ATTR.RES]) / 2 * 10; }));
-    var fr = frictionOf(data, members, hammer, stars);
+    var fr = frictionOf(data, members, hammer, stars, budget);
     var frTotal = sum(fr.map(function (f) { return f.penalty; }));
     var contributions = {
       challenge: S.wChallenge * challenge, synergy: S.wSynergy * syn.score, budget: S.wBudget * be,
@@ -226,13 +239,13 @@
           price: m.price, benchmark: m.c.benchmark, marketNote: m.c.marketNote };
       }),
       stars: stars, synergy: syn, rounds: rounds, challenge: challenge,
-      budget: { hammer: hammer, benchmark: bench, priceDiscipline: pd, valuePerRupee: vpr, efficiency: be },
+      budget: { total: budget, hammer: hammer, benchmark: bench, priceDiscipline: pd, valuePerRupee: vpr, efficiency: be },
       risk: risk, friction: { rules: fr, total: frTotal }, contributions: contributions, final: final
     };
   }
 
   /** Legality of a finished team (used by tests and the auction). */
-  function validateTeam(data, ids, prices) {
+  function validateTeam(data, ids, prices, budget) {
     var S = data.settings, I = idx(data), issues = [], perFn = {}, starsN = 0;
     if (ids.length !== S.seats) issues.push('team has ' + ids.length + ' members');
     if (new Set(ids).size !== ids.length) issues.push('duplicate candidate');
@@ -241,22 +254,260 @@
     });
     Object.keys(perFn).forEach(function (f) { if (perFn[f] > S.maxPerFunction) issues.push('3+ from ' + f); });
     if (starsN > S.maxStars) issues.push(starsN + ' stars');
-    if (prices && sum(prices) > S.budget + 1e-9) issues.push('over budget');
+    if (prices && sum(prices) > (budget || S.budget) + 1e-9) issues.push('over budget');
     return issues;
   }
 
-  return { scoreTeam: scoreTeam, synergyOf: synergyOf, validateTeam: validateTeam, index: idx, ATTR: ATTR, round1: round1 };
+  return { scoreTeam: scoreTeam, synergyOf: synergyOf, validateTeam: validateTeam, index: idx, ATTR: ATTR, round1: round1,
+    budgetOf: budgetOf, classicRounds: classicRounds };
 });
 
-/* ---- src/ai.js ---- */
-/* Talent Auction – AI bidder. Uses only what the player can see plus the static AI Value Index
- * (already folded into Candidates "AI Walk-Away Base"). Pure functions of the game state.
+/* ---- src/brain.js ---- */
+/* Talent Auction – the AI's planning brain.
+ *
+ * Before every lot the AI plans the best five-person team it can still build for THIS problem, from the
+ * candidates still to come, with the money it has left. It scores each plan with the game's own scoring
+ * (a fast copy of engine.scoreTeam, checked against it by a self-test), averaged over all the problem's
+ * possible twists, because it never knows which one will hit. A candidate is worth the score their plan
+ * reaches minus the best plan without them; the AI bids up to the highest price at which that is still true.
+ *
+ * Pure functions of the game state; no randomness. Every hard cap of the workbook's AI Strategy still applies.
  */
 (function (root, factory) {
   var isNode = typeof module === 'object' && module.exports;
   var mod = factory(isNode ? require('./engine.js') : root.TA.engine);
-  if (isNode) module.exports = mod; else { root.TA = root.TA || {}; root.TA.ai = mod; }
+  if (isNode) module.exports = mod; else { root.TA = root.TA || {}; root.TA.brain = mod; }
 })(typeof self !== 'undefined' ? self : this, function (engine) {
+  'use strict';
+
+  var CONFIG = {
+    beam: 8,                 // plans kept at each step of the search
+    competeLo: 0.3,          // expected price of a future lot = start + (lo + span x fit rank) x (benchmark - start)
+    competeSpan: 0.5,
+    lastCallShare: 0.1,      // a regular that went unsold comes back in last call close to its starting bid
+    missingSeat: 30,         // score cost of a plan that cannot fill a seat (forced fill is a bad outcome)
+    slopeStep: 6             // ₹L step used to measure how fast a plan loses score as the price rises
+  };
+
+  /* How each personality uses the same brain. pay: share of the value-equivalent price it will pay;
+   * risk: weight on expected twist damage; star: score bonus per fully active star (its taste for stars);
+   * compete: how much competition it expects for the candidates still to come. */
+  var STYLE = {
+    standard: { pay: 1.0, risk: 1.0, star: 0, compete: 1.0 },
+    analyst: { pay: 1.0, risk: 1.4, star: 0, compete: 0.95 },
+    maverick: { pay: 1.0, risk: 0.85, star: 1.2, compete: 1.05 }
+  };
+
+  /* ---------------- a fast, exact copy of the scoring for one problem ---------------- */
+  var ctxCache = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+  function context(data, roundId, budget) {
+    var key = roundId + '|' + budget, store = ctxCache && ctxCache.get(data);
+    if (!store) { store = {}; if (ctxCache) ctxCache.set(data, store); }
+    if (store[key]) return store[key];
+    var I = engine.index(data), S = data.settings, rd = I.round[roundId];
+    var codes = I.codes, twists = data.twists.filter(function (t) { return t.round === roundId; });
+    var fnNames = data.functions.map(function (f) { return f.name; });
+    var fnIdx = {}; fnNames.forEach(function (f, i) { fnIdx[f] = i; });
+    var syn = fnNames.map(function () { return fnNames.map(function () { return 0; }); });
+    data.synergy.forEach(function (p) { var a = fnIdx[p.a], b = fnIdx[p.b]; syn[a][b] += p.bonus; if (a !== b) syn[b][a] += p.bonus; });
+    var A = function (c, n) { return c.attrs[n]; };
+    var C = data.candidates.map(function (c, i) {
+      var a = 0; codes.forEach(function (k) { a += rd.weights[k] * c.comp[k]; });
+      var st = c.isStar ? I.star[c.id] : null, boost = 0, linked = 0;
+      if (st) { codes.forEach(function (k) { boost += rd.weights[k] * st.effects[roundId][k]; }); st.linked.forEach(function (f) { linked |= 1 << fnIdx[f]; }); }
+      var fit = 0, ws = 0; codes.forEach(function (k) { fit += rd.weights[k] * c.comp[k]; ws += rd.weights[k]; });
+      return { i: i, id: c.id, c: c, fn: fnIdx[c.function], rel: I.rel[c.function][roundId], a: a, star: !!st, boost: boost, linked: linked,
+        cancelsF2: st ? st.cancelsF2 : 0, ego: c.ego ? 1 : 0, fe: A(c, 'Functional Expertise'), comm: A(c, 'Communication'),
+        inno: A(c, 'Innovation / Creativity'), exec: A(c, 'Execution'), comAc: A(c, 'Commercial Acumen'), cust: A(c, 'Customer Orientation'),
+        lead: A(c, 'Leadership'), exp: c.experience, risk: (A(c, 'Adaptability') + A(c, 'Resilience')) / 2 * 10,
+        bench: c.benchmark, start: c.startingBid, sev: c.riskSeverity,
+        hit: twists.map(function (t) { return t.hits.indexOf(c.riskCode) >= 0; }), cover: twists.map(function (t) { return c.comp[t.cover]; }),
+        fit: ws ? fit / ws * 10 : 0 };
+    });
+    var byId = {}; C.forEach(function (x) { byId[x.id] = x; });
+    var fr = {}; data.friction.forEach(function (r) { fr[r.id] = r; });
+    var customerMask = 0; (fr.F5 ? fr.F5.functions : []).forEach(function (f) { customerMask |= 1 << fnIdx[f]; });
+    var ctx = { data: data, S: S, rd: rd, roundId: roundId, budget: budget, C: C, byId: byId, syn: syn, nFn: fnNames.length,
+      twists: twists, thr: twists.map(function (t) { return t.threshold; }), fr: fr, customerMask: customerMask,
+      refRate: S.referenceChallenge / (S.referenceSpendShare * budget) };
+    store[key] = ctx;
+    return ctx;
+  }
+
+  /** Score a squad (array of {x, price}) for this problem: per-twist finals + their mean, exactly as engine.scoreTeam does. */
+  function quick(ctx, team, style) {
+    var S = ctx.S, n = team.length, i, j, t;
+    if (!n) return { mean: 0, finals: [], penalty: 0 };
+    var relSum = 0, relA = 0, fnMask = 0, hammer = 0, bench = 0, risk = 0, starPerf = 0, maxF2 = 0, activeStars = 0;
+    var ego = 0, spec = 0, inno = 0, exec = 0, comAc = 0, cust = 0, juniors = 0, maxLead = 0;
+    var fr = ctx.fr;
+    for (i = 0; i < n; i++) {
+      var x = team[i].x; relSum += x.rel; relA += x.rel * x.a; fnMask |= 1 << x.fn; hammer += team[i].price; bench += x.bench; risk += x.risk;
+      ego += x.ego; if (fr.F2 && x.fe >= fr.F2.p1 && x.comm <= fr.F2.p2) spec++; inno += x.inno; exec += x.exec; comAc += x.comAc; cust += x.cust;
+      if (fr.F6 && x.exp <= fr.F6.p1) juniors++; if (x.lead > maxLead) maxLead = x.lead;
+    }
+    for (i = 0; i < n; i++) {
+      var s = team[i].x; if (!s.star) continue;
+      var linked = 0; for (j = 0; j < n; j++) if (j !== i && (s.linked >> team[j].x.fn) & 1) linked++;
+      var act = Math.min(1, linked / S.starActivationDivisor);
+      starPerf += act * s.boost; if (act * s.cancelsF2 > maxF2) maxF2 = act * s.cancelsF2; activeStars += act;
+    }
+    // synergy: every data pair whose two functions are both present, counted once
+    var synRaw = 0;
+    for (i = 0; i < ctx.nFn; i++) if ((fnMask >> i) & 1) for (j = i; j < ctx.nFn; j++) if ((fnMask >> j) & 1 && ctx.syn[i][j]) synRaw += i === j ? 0 : ctx.syn[i][j];
+    var synScore = Math.min(synRaw, S.synergyCap) / S.synergyCap * 100;
+    var raw = 10 * (relA / relSum + starPerf) + ctx.rd.synergyWeight * synScore;
+    // friction (direct points)
+    var fric = 0;
+    if (fr.F1 && ego >= fr.F1.p1) fric += fr.F1.penalty;
+    if (fr.F2 && spec >= fr.F2.p3) fric += fr.F2.penalty * (1 - maxF2);
+    if (fr.F3 && inno / n >= fr.F3.p1 && exec / n < fr.F3.p2) fric += fr.F3.penalty;
+    if (fr.F4 && hammer > fr.F4.p1 * ctx.budget && comAc / n < fr.F4.p2) fric += fr.F4.penalty;
+    if (fr.F5 && !(fnMask & ctx.customerMask) && cust / n < fr.F5.p1) fric += fr.F5.penalty;
+    if (fr.F6 && juniors >= fr.F6.p2 && maxLead < fr.F6.p3) fric += fr.F6.penalty;
+    var pd = Math.max(0, Math.min(100, 50 + 100 * S.priceDisciplineSlope * (1 - hammer / bench)));
+    var finals = [], sumF = 0, sumPen = 0;
+    for (t = 0; t < ctx.twists.length; t++) {
+      // the best and second-best cover on the team, so each member's "best other teammate" is O(1)
+      var b1 = -1, b2 = -1, bi = -1;
+      for (i = 0; i < n; i++) { var cv = team[i].x.cover[t]; if (cv > b1) { b2 = b1; b1 = cv; bi = i; } else if (cv > b2) b2 = cv; }
+      var pen = 0;
+      for (i = 0; i < n; i++) { var m = team[i].x; if (!m.hit[t]) continue; var other = n < 2 ? 0 : (i === bi ? b2 : b1); if (other < ctx.thr[t]) pen += m.sev * S.twistPenaltyPerSeverity; }
+      var chal = raw - pen;
+      var vpr = hammer > 0 ? Math.min(100, 50 * (chal / hammer) / ctx.refRate) : 100;
+      var f = S.wChallenge * chal + S.wSynergy * synScore + S.wBudget * (0.5 * pd + 0.5 * vpr) + S.wRisk * (risk / n) + fric;
+      finals.push(f); sumF += f; sumPen += pen;
+    }
+    var T = ctx.twists.length || 1, mean = sumF / T, penMean = sumPen / T;
+    var st = style || STYLE.standard;
+    return { mean: mean, finals: finals, penalty: penMean,
+      value: mean - (st.risk - 1) * S.wChallenge * penMean + st.star * activeStars };
+  }
+
+  /* ---------------- planning ---------------- */
+  /** Best completion of `fixed` with `seats` more picks from `pool` ({x, exp}) for at most `money`. */
+  function plan(ctx, fixed, pool, seats, money, style, limits) {
+    var S = ctx.S;
+    var fnCount = new Array(ctx.nFn).fill(0), stars = 0;
+    fixed.forEach(function (m) { fnCount[m.x.fn]++; if (m.x.star) stars++; });
+    var minPrice = pool.reduce(function (a, p) { return Math.min(a, p.exp); }, Infinity);
+    if (!isFinite(minPrice)) minPrice = S.reserveFloor;
+    var beam = [{ team: fixed.slice(), last: -1, cost: 0, fn: fnCount, stars: stars, v: fixed.length ? quick(ctx, fixed, style).value : 0 }];
+    for (var step = 0; step < seats; step++) {
+      var next = [];
+      beam.forEach(function (b) {
+        var left = seats - step - 1;
+        for (var k = b.last + 1; k < pool.length; k++) {
+          var p = pool[k], x = p.x;
+          if (b.fn[x.fn] >= S.maxPerFunction) continue;
+          if (x.star && b.stars >= S.maxStars) continue;
+          var cost = b.cost + p.exp;
+          if (money - cost < left * Math.max(minPrice, S.reserveFloor) - 1e-9) continue;
+          var team = b.team.concat([{ x: x, price: p.exp }]);
+          var fn = b.fn.slice(); fn[x.fn]++;
+          next.push({ team: team, last: k, cost: cost, fn: fn, stars: b.stars + (x.star ? 1 : 0), v: quick(ctx, team, style).value });
+        }
+      });
+      if (!next.length) break;
+      next.sort(function (a, b) { return b.v - a.v; });
+      beam = next.slice(0, limits && limits.beam || CONFIG.beam);
+    }
+    var best = beam[0], missing = S.seats - best.team.length;
+    return { value: best.v - missing * CONFIG.missingSeat, team: best.team, missing: missing, cost: best.cost };
+  }
+
+  /* ---------------- the AI's view of the auction ---------------- */
+  function fitRanks(ctx) {
+    if (ctx.fitRank) return ctx.fitRank;
+    var sorted = ctx.C.slice().sort(function (a, b) { return a.fit - b.fit; }), r = {};
+    sorted.forEach(function (x, i) { r[x.id] = sorted.length > 1 ? i / (sorted.length - 1) : 0.5; });
+    ctx.fitRank = r; return r;
+  }
+  /** Candidates this side could still sign after the current lot, each with the price the AI expects to pay. */
+  function futurePool(game, ctx, side, exceptId, style) {
+    var rank = fitRanks(ctx), out = [], seen = {};
+    var lastCallAhead = game.phase === 'main';
+    for (var i = game.pos + 1; i < game.queue.length; i++) {
+      var q = game.queue[i]; if (q.id === exceptId || game.sold[q.id] || seen[q.id]) continue;
+      var x = ctx.byId[q.id]; seen[q.id] = 1;
+      var share = q.phase === 'lastcall' ? CONFIG.lastCallShare : style.compete * (CONFIG.competeLo + CONFIG.competeSpan * rank[q.id]);
+      out.push({ x: x, exp: Math.ceil(x.start + Math.min(1, share) * Math.max(0, x.bench - x.start)) });
+    }
+    if (lastCallAhead) (game.unsold || []).forEach(function (id) {
+      if (id === exceptId || game.sold[id] || seen[id]) return; var x = ctx.byId[id]; if (!x || x.star) return; seen[id] = 1;
+      out.push({ x: x, exp: Math.ceil(x.start + CONFIG.lastCallShare * Math.max(0, x.bench - x.start)) });
+    });
+    return out;
+  }
+
+  var walkCache = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+  /**
+   * The most this side should pay for candidate `id` right now, from its plans.
+   * Returns { final, value, binding, blocked, skip, gain, planWith:[ids], planWithout:[ids], ... }.
+   */
+  function think(game, id, side, styleName) {
+    var data = game.data, S = data.settings, t = game.teams[side];
+    var budget = game.budget || engine.budgetOf(data, game.challenge ? { rounds: [game.challenge] } : null);
+    var key = [side, id, game.pos, game.phase, t.purse, t.squad.map(function (m) { return m.id; }).join(','), styleName].join('|');
+    var memo = walkCache && walkCache.get(game);
+    if (!memo) { memo = {}; if (walkCache) walkCache.set(game, memo); }
+    if (memo[key]) return memo[key];
+    var ctx = context(data, game.challenge, budget), style = STYLE[styleName] || STYLE.standard, x = ctx.byId[id];
+    var open = S.seats - t.squad.length;
+    var fixed = t.squad.map(function (m) { return { x: ctx.byId[m.id], price: m.price }; });
+    var res = { id: id, brain: true, final: 0, value: 0, binding: 'value', blocked: null, skip: true, gain: 0, planWith: [], planWithout: [] };
+    var fnHeld = fixed.filter(function (m) { return m.x.fn === x.fn; }).length, starHeld = fixed.some(function (m) { return m.x.star; });
+    if (open <= 0) res.blocked = 'squad full';
+    else if (fnHeld >= S.maxPerFunction) res.blocked = 'function full';
+    else if (x.star && starHeld) res.blocked = 'already has a star';
+    if (res.blocked) { res.binding = res.blocked; memo[key] = res; return res; }
+    // hard caps from the workbook's AI Strategy
+    var cap = t.purse - (open - 1) * S.reserveFloor, capName = 'reserve';
+    if (x.star) {
+      if (S.aiStarCapMultiple * x.bench < cap) { cap = S.aiStarCapMultiple * x.bench; capName = 'star cap'; }
+      var sr = t.purse - (open - 1) * S.aiStarReservePerSeat * budget / S.budget; if (sr < cap) { cap = sr; capName = 'star reserve'; }
+    }
+    var pool = futurePool(game, ctx, side, id, style);
+    var without = plan(ctx, fixed, pool, open, t.purse, style);
+    var withAt = function (p) { return plan(ctx, fixed.concat([{ x: x, price: p }]), pool, open - 1, t.purse - p, style); };
+    var lo = x.start;
+    if (cap < lo) { res.binding = capName; res.final = Math.max(0, cap); memo[key] = res; return res; }
+    var w0 = withAt(lo);
+    res.planWithout = without.team.slice(fixed.length).map(function (m) { return m.x.id; });
+    res.planWith = w0.team.slice(fixed.length + 1).map(function (m) { return m.x.id; });
+    res.gain = w0.value - without.value;
+    if (res.gain <= 0) { res.final = lo - 1; res.value = lo - 1; res.binding = 'not in plan'; memo[key] = res; return res; }
+    // how fast the plan with this candidate loses value as the price rises; the break-even price is where it meets the plan without
+    var step = CONFIG.slopeStep, hiP = Math.min(cap, lo + step), w1 = hiP > lo ? withAt(hiP) : w0;
+    var slope = hiP > lo ? (w0.value - w1.value) / (hiP - lo) : 0;
+    var be = slope > 1e-6 ? lo + res.gain / slope : cap;
+    if (be > cap) be = cap;
+    // check the break-even price is really affordable; step back until the plan holds
+    for (var k = 0; k < 4 && be > lo; k++) { var wb = withAt(be); if (wb.value >= without.value - 1e-9) break; be = lo + (be - lo) * 0.6; }
+    var value = lo + (be - lo) * style.pay;
+    res.value = value;
+    res.final = Math.min(value, cap);
+    res.binding = value > cap ? capName : 'value';
+    res.skip = res.final < lo;
+    memo[key] = res;
+    return res;
+  }
+
+  return { CONFIG: CONFIG, STYLE: STYLE, context: context, quick: quick, plan: plan, futurePool: futurePool, think: think };
+});
+
+/* ---- src/ai.js ---- */
+/* Talent Auction – AI bidder.
+ * In a one-problem game (every game a player starts) the AI thinks with its planning brain (src/brain.js):
+ * it plans the best team it can still build for the problem and bids up to what each candidate adds to
+ * that plan, inside every hard cap of the workbook's AI Strategy. The workbook's original walk-away formula
+ * ("classic") is kept for the three-round scoring tests and as a reference. Pure functions of the game state.
+ */
+(function (root, factory) {
+  var isNode = typeof module === 'object' && module.exports;
+  var mod = isNode ? factory(require('./engine.js'), require('./brain.js')) : factory(root.TA.engine, root.TA.brain);
+  if (isNode) module.exports = mod; else { root.TA = root.TA || {}; root.TA.ai = mod; }
+})(typeof self !== 'undefined' ? self : this, function (engine, brain) {
   'use strict';
 
   /* Behaviour constants the workbook does not specify (documented in ASSUMPTIONS.md). */
@@ -272,11 +523,11 @@
    * (squad reserve, star cap, star reserve, one star) apply to every personality. */
   var PERSONAS = {
     standard: { id: 'standard', name: 'AI Manager', walkMult: 1, starMult: 1, repeatMult: 1, pushLots: 2,
-      blurb: 'Bids by the workbook\'s AI Strategy.' },
+      blurb: 'Plans the best team for the problem and bids what each candidate adds to it.' },
     analyst: { id: 'analyst', name: 'The Analyst', walkMult: 0.98, starMult: 0.9, repeatMult: 0.9, pushLots: 0,
-      blurb: 'Value hunter. Shaves 2% off every limit, 10% off stars and second hires in a function, never price-pushes.' },
+      blurb: 'Careful planner. Weighs twist insurance 40% more and expects bargains later in the auction.' },
     maverick: { id: 'maverick', name: 'The Maverick', walkMult: 1, starMult: 1.2, repeatMult: 1, pushLots: 2,
-      blurb: 'Star chaser. Goes 20% higher on marquee stars (hard caps still apply) and price-pushes like the standard AI.' }
+      blurb: 'Star chaser. Gives an active star extra value and takes more twist risk to land one.' }
   };
   function persona(game, side) {
     var p = game.personas && game.personas[side];
@@ -313,6 +564,15 @@
   /** Walk-away price for an AI-controlled side (default 'ai') on candidate `id`, given that side's squad now. */
   function walkAway(game, id, side) {
     side = side || 'ai';
+    if (game.challenge && brain && !game.classicAI) {
+      var b = brain.think(game, id, side, persona(game, side).id), cb = cand(game, id);
+      return { id: id, brain: true, base: b.value, raw: b.value, final: Math.max(0, b.final), binding: b.binding, blocked: b.blocked,
+        skip: b.final < cb.startingBid, gain: b.gain, planWith: b.planWith, planWithout: b.planWithout, uncovered: null, synergyPoints: 0, synergyPairs: [] };
+    }
+    return classicWalk(game, id, side);
+  }
+  /** The workbook's original walk-away formula (AI Strategy sheet). */
+  function classicWalk(game, id, side) {
     var S = game.data.settings, c = cand(game, id), t = team(game, side), P = persona(game, side);
     var open = S.seats - t.squad.length;
     var fns = t.squad.map(function (m) { return cand(game, m.id).function; });
@@ -380,6 +640,7 @@
     var c = cand(game, lot.id);
     if (w.final < c.startingBid) return { action: 'pass', reason: 'walk-away below starting bid', walk: w };
     if (cb.price > w.final) return { action: 'pass', reason: 'price above walk-away', walk: w };
+    if (w.brain) return { action: 'bid', reason: 'in plan', walk: w };
     if (isWanted(game, lot.id, side)) return { action: 'bid', reason: 'wanted', walk: w };
     var pushed = game.pushLots ? game.pushLots[side] : game.aiPushLots, limit = Math.min(CONFIG.maxPushLots, P.pushLots);
     var canPush = lot.leader === otherSide(side) && ((lot.pushed ? lot.pushed[side] : lot.aiPushed) || pushed.length < limit) && humanTight(game, side);
@@ -393,7 +654,7 @@
     return game.aiRng.float(CONFIG.delayMin, Math.max(CONFIG.delayMin, hi));
   }
 
-  return { CONFIG: CONFIG, PERSONAS: PERSONAS, persona: persona, baseWalk: baseWalk, walkAway: walkAway, decide: decide, delay: delay, isWanted: isWanted, humanTight: humanTight };
+  return { CONFIG: CONFIG, PERSONAS: PERSONAS, persona: persona, baseWalk: baseWalk, walkAway: walkAway, classicWalk: classicWalk, decide: decide, delay: delay, isWanted: isWanted, humanTight: humanTight };
 });
 
 /* ---- src/auction.js ---- */
@@ -438,17 +699,19 @@
       rng.shuffle(inSet).forEach(function (c) { queue.push({ id: c.id, kind: 'regular', phase: 'main', set: set }); });
     });
     var twists = {};
-    data.rounds.forEach(function (r) {
+    (challenge ? data.rounds : engine.classicRounds(data)).forEach(function (r) {
       if (challenge && r.id !== challenge) return;
       twists[r.id] = rng.pick(data.twists.filter(function (t) { return t.round === r.id; })).id;
     });
+    // every problem has its own budget (Challenges!X); the classic three-round game uses Settings
+    var budget = engine.budgetOf(data, challenge ? { rounds: [challenge] } : null);
     var game = {
-      data: data, seed: String(seed), challenge: challenge, aiRng: RNG.make(seed + ':ai'), twists: twists,
+      data: data, seed: String(seed), challenge: challenge, budget: budget, aiRng: RNG.make(seed + ':ai'), twists: twists,
       mode: mode.id, controllers: { human: mode.controllers.human, ai: mode.controllers.ai }, personas: personas, names: names,
       offeredStars: stars.map(function (c) { return c.id; }),
       withdrawnStars: data.candidates.filter(function (c) { return c.isStar && stars.indexOf(c) < 0; }).map(function (c) { return c.id; }),
       queue: queue, pos: -1, phase: 'main', lastCallBuilt: false,
-      teams: { human: { purse: S.budget, squad: [] }, ai: { purse: S.budget, squad: [] } },
+      teams: { human: { purse: budget, squad: [] }, ai: { purse: budget, squad: [] } },
       sold: {}, unsold: [], log: [], events: [], pushLots: { human: [], ai: [] }, lot: null, lotsReached: 0, done: false, lastResult: null
     };
     game.aiPushLots = game.pushLots.ai;
@@ -597,6 +860,7 @@
       no: lot.no, id: lot.id, name: c.name, function: c.function, kind: lot.kind, phase: lot.phase,
       winner: winner, price: winner ? lot.price : null, benchmark: c.benchmark, startingBid: c.startingBid,
       aiWalk: lot.aiWalkAtStart.final, aiWalkBinding: lot.aiWalkAtStart.binding,
+      aiGain: lot.aiWalkAtStart.brain ? Math.round(lot.aiWalkAtStart.gain * 10) / 10 : null,
       humanWalk: lot.humanWalkAtStart ? lot.humanWalkAtStart.final : null, humanPushed: lot.pushed.human,
       maxBid: { human: lot.bids.filter(function (b) { return b.side === 'human'; }).map(function (b) { return b.price; }).pop() || null,
         ai: lot.bids.filter(function (b) { return b.side === 'ai'; }).map(function (b) { return b.price; }).pop() || null },
@@ -773,7 +1037,7 @@
       var t = game.teams[s], ids = t.squad.map(function (m) { return m.id; });
       if (ids.length !== S.seats) issues.push(s + ' squad has ' + ids.length);
       if (t.purse < -1e-9) issues.push(s + ' purse negative');
-      engine.validateTeam(game.data, ids, t.squad.map(function (m) { return m.price; })).forEach(function (i) { issues.push(s + ': ' + i); });
+      engine.validateTeam(game.data, ids, t.squad.map(function (m) { return m.price; }), game.budget).forEach(function (i) { issues.push(s + ': ' + i); });
     });
     var h = game.teams.human.squad.map(function (m) { return m.id; });
     game.teams.ai.squad.forEach(function (m) { if (h.indexOf(m.id) >= 0) issues.push('candidate on both teams'); });
@@ -939,7 +1203,12 @@
     var aiLots = mode === 'hvh' ? [] : game.log.filter(function (l) { return !l.forced && (l.contested || l.aiPushed || l.winner === 'ai' || (l.winner === 'human' && l.aiWalk >= l.startingBid)); })
       .map(function (l) {
         var tag = l.aiPushed ? 'Price push' : l.aiOverpaid ? nm.ai + ' overpaid' : l.winner === 'ai' ? nm.ai + ' bought' : l.aiSkipped ? nm.ai + ' skipped' : nm.ai + ' let go';
-        return { no: l.no, name: l.name, winner: l.winner, winnerLabel: l.winner ? W[l.winner] : 'Unsold', price: l.price, aiWalk: l.aiWalk,
+        var b = l.aiWalkBinding, why = '';
+        if (b === 'not in plan') why = 'Not in its plan';
+        else if (b === 'squad full' || b === 'function full' || b === 'already has a star') why = 'Blocked: ' + b;
+        else if (l.aiGain !== null && l.aiGain !== undefined) why = 'In its plan: +' + l.aiGain.toFixed(1) + ' pts' + (b && b !== 'value' ? ' (' + b + ')' : '');
+        else if (b && b !== 'value') why = 'Limit: ' + b;
+        return { no: l.no, name: l.name, winner: l.winner, winnerLabel: l.winner ? W[l.winner] : 'Unsold', price: l.price, aiWalk: l.aiWalk, why: why,
           humanWalk: l.humanWalk, benchmark: l.benchmark, tag: tag, contested: l.contested };
       });
 
@@ -951,7 +1220,7 @@
     var aiRatio = A.budget.hammer / A.budget.benchmark, huRatio = H.budget.hammer / H.budget.benchmark;
     var letGo = game.log.filter(function (l) { return l.contested && l.winner === 'human'; });
     var parts = [];
-    parts.push('The AI spent ' + money(A.budget.hammer) + ' of ' + money(data.settings.budget) + ' (you: ' + money(H.budget.hammer) + ') and paid ' + pct(aiRatio) + ' of benchmark on average (you: ' + pct(huRatio) + ').');
+    parts.push('The AI spent ' + money(A.budget.hammer) + ' of ' + money(A.budget.total) + ' (you: ' + money(H.budget.hammer) + ') and paid ' + pct(aiRatio) + ' of benchmark on average (you: ' + pct(huRatio) + ').');
     if (A.stars.length) {
       var aiStarLog = game.log.filter(function (l) { return l.id === A.stars[0].id; })[0];
       parts.push('It committed to ' + A.stars[0].name + (aiStarLog ? ' at ' + money(aiStarLog.price) + ' (its ceiling was ' + money(aiStarLog.aiWalk) + ')' : '') + ' and then built around the star\'s linked functions, so the effect ended ' + A.stars[0].state + '.');
@@ -1776,7 +2045,7 @@
       pass: st.failed === 0, detail: st.failed ? st.failures.join(' | ') : 'avg lots reached ' + st.avgLots.toFixed(1) + ' (passive style included), forced claims ' + st.forced });
     var active = ['balanced', 'starChaser', 'valueHunter', 'random'].map(function (k) { return st.perStyle[k]; }).filter(Boolean);
     var lots = active.reduce(function (s, p) { return s + p.lots; }, 0) / active.reduce(function (s, p) { return s + p.games; }, 0);
-    out.push({ name: 'Game length with an active human', pass: lots >= 10 && lots <= 20, detail: 'avg ' + lots.toFixed(1) + ' lots reached' });
+    out.push({ name: 'Game length with an active human (the planning AI waits for its best fits, so it can run past the human\u2019s fifth hire)', pass: lots >= 10 && lots <= 30, detail: 'avg ' + lots.toFixed(1) + ' lots reached' });
     // single-problem mode: challenge = that round's score; AI base walk reproduces the workbook formula
     var r3 = engine.scoreTeam(data, SCORING[0].ids, SCORING[0].prices, SCORING[0].twists);
     var r1 = engine.scoreTeam(data, SCORING[0].ids, SCORING[0].prices, { C2: 'T2A' }, { rounds: ['C2'] });
@@ -1787,6 +2056,37 @@
     var maxErr = 0; data.candidates.forEach(function (c) { maxErr = Math.max(maxErr, Math.abs(AI.baseWalk(gw3, c) - c.aiWalkAwayBase)); });
     out.push({ name: 'AI walk-away formula reproduces the workbook column; per-problem version uses that Fit column',
       pass: maxErr < 1e-9 && Object.keys(gw.twists).join() === 'C1', detail: 'max diff ' + maxErr.toExponential(1) });
+    // company layer: every problem belongs to one company and sets both purses to its own budget
+    var coOk = (data.companies || []).length === 3 && data.companies.every(function (co) { return co.rounds.length === 3; }), coBad = [];
+    data.rounds.forEach(function (rd) {
+      var gb = A.createGame(data, 'UNIT-CO-' + rd.id, { challenge: rd.id });
+      if (gb.teams.human.purse !== rd.budget || gb.teams.ai.purse !== rd.budget || gb.budget !== rd.budget) coBad.push(rd.id + ' purse');
+      if (engine.scoreTeam(data, SCORING[0].ids, SCORING[0].prices, (function () { var o = {}; o[rd.id] = gb.twists[rd.id]; return o; })(), { rounds: [rd.id] }).budget.total !== rd.budget) coBad.push(rd.id + ' scoring budget');
+      if (Object.keys(gb.twists).join() !== rd.id) coBad.push(rd.id + ' twist');
+    });
+    var minStar = Math.min.apply(null, data.candidates.filter(function (c) { return c.isStar; }).map(function (c) { return c.startingBid; }));
+    var tight = data.rounds.filter(function (rd) { return minStar + (S.seats - 1) * S.reserveFloor > rd.budget; }).map(function (rd) { return rd.id; });
+    out.push({ name: 'Companies: 3 companies × 3 problems; each problem sets both purses and the scoring to its own budget',
+      pass: coOk && !coBad.length && !!engine.budgetOf && engine.budgetOf(data, null) === S.budget,
+      detail: coBad.length ? coBad.join(', ') : 'budgets ' + data.rounds.map(function (rd) { return rd.id + ' ₹' + rd.budget + 'L'; }).join(' · ') + (tight.length ? ' · no star affordable in ' + tight.join(', ') : '') });
+    // the AI's planning brain scores teams exactly as the engine does (every problem, every twist)
+    var BR = (typeof module === 'object' && module.exports) ? require('./brain.js') : (typeof self !== 'undefined' ? self : this).TA.brain;
+    var bErr = 0, bN = 0, ncand = data.candidates.length;
+    data.rounds.forEach(function (rd) {
+      var ctx = BR.context(data, rd.id, rd.budget || S.budget);
+      for (var k = 0; k < 40; k++) {
+        var ids = [], used = {}, step = 7 + (k % 5) * 2, at = (k * 13 + rd.id.length) % ncand;
+        while (ids.length < S.seats) { var cc = data.candidates[at % ncand]; if (!used[cc.id]) { used[cc.id] = 1; ids.push(cc.id); } at += step; }
+        var prices = ids.map(function (id, i) { return 10 + ((k * 7 + i * 11) % 60); });
+        var q = BR.quick(ctx, ids.map(function (id, i) { return { x: ctx.byId[id], price: prices[i] }; }));
+        ctx.twists.forEach(function (tw, ti) {
+          var tm = {}; tm[rd.id] = tw.id;
+          var e = engine.scoreTeam(data, ids, prices, tm, { rounds: [rd.id] });
+          bErr = Math.max(bErr, Math.abs(e.final - q.finals[ti])); bN++;
+        });
+      }
+    });
+    out.push({ name: 'AI planning brain scores teams exactly like the game (' + bN + ' team × twist checks)', pass: bErr < 1e-9, detail: 'max diff ' + bErr.toExponential(1) });
     // game modes: AI vs AI and Human vs Human (scripted) finish legally; Human vs AI is unchanged by default
     var md = sim.runModes(data, Math.max(30, Math.round((n || 500) / 5)), 'QA-MODE');
     out.push({ name: md.ava.games + ' AI vs AI games (The Analyst vs The Maverick) finish with full, legal, solvent squads',
@@ -1799,12 +2099,13 @@
         A.createGame(data, 'UNIT-M', { mode: 'ava' }).controllers.human === 'ai' && A.createGame(data, 'UNIT-M', { mode: 'hvh' }).controllers.ai === 'person' });
     // debrief builds for a sample game
     var sg = sim.playGame(data, 'QA-DEBRIEF', 'balanced', 'C3'), sc = A.scoreBoth(sg), db = D.build(data, sg, sc);
-    out.push({ name: 'Debrief is generated with gaps, twists, hires and AI walk-aways', pass: db.gaps.length > 0 && db.twists.length === 1 && db.hires.human.length === S.seats });
+    out.push({ name: 'Debrief is generated with gaps, twists, hires and AI walk-aways (each with the AI\u2019s reason)', pass: db.gaps.length > 0 && db.twists.length === 1 && db.hires.human.length === S.seats &&
+      db.aiLots.length > 0 && db.aiLots.every(function (x) { return !!x.why; }) });
     // match report: the factor ledger adds up to the final-score margin exactly, in every mode
     var worst = 0, bad = [], n2 = 0;
     ['hva', 'hvh', 'ava'].forEach(function (mode, mi) {
       for (var i = 0; i < 20; i++) {
-        var gr = sim.playMatch(data, 'QA-REP-' + mode + '-' + i, { mode: mode, challenge: data.rounds[(i + mi) % 3].id, styles: { human: 'balanced', ai: 'starChaser' } });
+        var gr = sim.playMatch(data, 'QA-REP-' + mode + '-' + i, { mode: mode, challenge: data.rounds[(i + mi) % data.rounds.length].id, styles: { human: 'balanced', ai: 'starChaser' } });
         var sr = A.scoreBoth(gr), rp = R.build(data, gr, sr); n2++;
         var err = Math.abs(rp.ledgerSum - rp.margin); worst = Math.max(worst, err);
         if (!rp.tie && (!rp.edges.length || !rp.verdict || rp.squads.human.length !== S.seats || !rp.decisive.length)) bad.push(gr.seed);
@@ -1816,7 +2117,7 @@
     var tBad = [], tN = 0, tMade = 0, tGain = 0;
     ['hva', 'hvh', 'ava'].forEach(function (mode, mi) {
       for (var i = 0; i < 15; i++) {
-        var gt = sim.playMatch(data, 'QA-TR-' + mode + '-' + i, { mode: mode, challenge: data.rounds[(i + mi) % 3].id });
+        var gt = sim.playMatch(data, 'QA-TR-' + mode + '-' + i, { mode: mode, challenge: data.rounds[(i + mi) % data.rounds.length].id });
         ['human', 'ai'].forEach(function (side) {
           var opt = X.options(data, gt, side), best = opt.swaps[0]; tN++;
           if (!best || best.gain <= 0) return;
@@ -1825,7 +2126,7 @@
           if (Math.abs(sc2[side].final - best.after) > 1e-9) tBad.push(gt.seed + ' gain mismatch');
         });
         var iss = sim.checkGame(gt); if (iss.length) tBad.push(gt.seed + ': ' + iss.join('; '));
-        var ga = sim.playMatch(data, 'QA-TRAI-' + i, { mode: 'ava', challenge: data.rounds[i % 3].id }), b0 = A.scoreBoth(ga).ai.final, pk = X.aiPick(data, ga, 'ai');
+        var ga = sim.playMatch(data, 'QA-TRAI-' + i, { mode: 'ava', challenge: data.rounds[i % data.rounds.length].id }), b0 = A.scoreBoth(ga).ai.final, pk = X.aiPick(data, ga, 'ai');
         if (pk) { X.apply(data, ga, pk); if (A.scoreBoth(ga).ai.final < b0 - 1e-9) tBad.push(ga.seed + ' AI got worse'); }
       }
     });
@@ -1835,7 +2136,7 @@
     var pBad = [], pN = 0, pUnder = 0;
     ['hva', 'hvh', 'ava'].forEach(function (mode, mi) {
       for (var i = 0; i < 12; i++) {
-        var gp = sim.playMatch(data, 'QA-PM-' + mode + '-' + i, { mode: mode, challenge: data.rounds[(i + mi) % 3].id });
+        var gp = sim.playMatch(data, 'QA-PM-' + mode + '-' + i, { mode: mode, challenge: data.rounds[(i + mi) % data.rounds.length].id });
         var before = JSON.stringify(gp.teams), scp = A.scoreBoth(gp);
         ['human', 'ai'].forEach(function (side) {
           var an = PM.analyse(data, gp, side), Rr = scp[side].rounds[0], wC = data.settings.wChallenge, drag = 0, tw = 0, fr = 0;
