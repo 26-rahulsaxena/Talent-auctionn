@@ -206,6 +206,14 @@
           covered: exposed && covered, penalty: pen };
       });
       var penalty = sum(exposures.map(function (e) { return e.penalty; }));
+      // each hire's own points in this round (final-score points): their share of the team's skill score,
+      // plus the star boost they bring, minus their own twist penalty. They add up to the round's skill part.
+      var memberPts = members.map(function (m, i) {
+        var a = 0; codes.forEach(function (code) { a += rd.weights[code] * m.c.comp[code]; });
+        var st = stars.filter(function (x) { return x.id === m.c.id; })[0], boost = 0;
+        if (st) codes.forEach(function (code) { boost += rd.weights[code] * st.activation * I.star[st.id].effects[rd.id][code]; });
+        return S.wChallenge * (10 * rel[i] * a / relSum + 10 * boost - exposures[i].penalty);
+      });
       var perf = 0; codes.forEach(function (code) { perf += rd.weights[code] * eff[code]; });
       var raw = 10 * perf + rd.synergyWeight * syn.score;
       var kpis = I.kpis[rd.id].map(function (k) {
@@ -213,7 +221,7 @@
         var hit = k.name === tw.kpi;
         return { name: k.name, question: k.question, base: 10 * v, value: 10 * v - (hit ? penalty * S.twistKpiMultiplier : 0), hit: hit };
       });
-      return { id: rd.id, name: rd.name, teamComp: teamComp, starMod: starMod, effComp: eff, raw: raw,
+      return { id: rd.id, name: rd.name, teamComp: teamComp, starMod: starMod, effComp: eff, raw: raw, memberPts: memberPts,
         penalty: penalty, score: raw - penalty, twist: tw, exposures: exposures, kpis: kpis };
     });
 
@@ -227,11 +235,20 @@
     var risk = avg(members.map(function (m) { return (m.c.attrs[ATTR.ADAPT] + m.c.attrs[ATTR.RES]) / 2 * 10; }));
     var fr = frictionOf(data, members, hammer, stars, budget);
     var frTotal = sum(fr.map(function (f) { return f.penalty; }));
+    // hire points averaged over the rounds played; the team MVP is the hire with the most points
+    var players = members.map(function (m, i) {
+      var pen = avg(rounds.map(function (r) { return r.exposures[i].penalty; }));
+      return { id: m.c.id, name: m.c.name, points: avg(rounds.map(function (r) { return r.memberPts[i]; })), hit: pen > 0, twistPenalty: S.wChallenge * pen };
+    });
+    var top = Math.max.apply(null, players.map(function (p) { return p.points; }));
+    var teamAvg = avg(players.map(function (p) { return p.points; }));
+    players.forEach(function (p) { p.mvp = p.points >= top - 1e-9; });
+    var cap = captainOf(opts && opts.captain, players, teamAvg);
     var contributions = {
       challenge: S.wChallenge * challenge, synergy: S.wSynergy * syn.score, budget: S.wBudget * be,
-      risk: S.wRisk * risk, friction: frTotal
+      risk: S.wRisk * risk, friction: frTotal, captain: cap ? cap.points : 0
     };
-    var final = contributions.challenge + contributions.synergy + contributions.budget + contributions.risk + contributions.friction;
+    var final = contributions.challenge + contributions.synergy + contributions.budget + contributions.risk + contributions.friction + contributions.captain;
     return {
       ids: ids.slice(), twists: twists,
       members: members.map(function (m) {
@@ -240,8 +257,22 @@
       }),
       stars: stars, synergy: syn, rounds: rounds, challenge: challenge,
       budget: { total: budget, hammer: hammer, benchmark: bench, priceDiscipline: pd, valuePerRupee: vpr, efficiency: be },
-      risk: risk, friction: { rules: fr, total: frTotal }, contributions: contributions, final: final
+      risk: risk, friction: { rules: fr, total: frTotal }, contributions: contributions, final: final,
+      players: players, teamAvg: teamAvg, captain: cap
     };
+  }
+
+  /** Captain rule. The captain doubles their edge over the team average if they finish as the team MVP; a captain hit by
+   *  the twist pays their twist penalty twice more (2x, on top of the normal hit); a captain released in the transfer window scores nothing. */
+  var CAPTAIN = { bonusMultiple: 2, hitMultiple: 2 };
+  function captainOf(id, players, teamAvg) {
+    if (!id) return null;
+    var p = players.filter(function (x) { return x.id === id; })[0];
+    if (!p) return { id: id, inTeam: false, kind: 'released', points: 0, edge: 0, mvp: false, hit: false };
+    var edge = p.points - teamAvg;
+    if (p.hit) return { id: id, name: p.name, inTeam: true, kind: 'hit', points: -CAPTAIN.hitMultiple * p.twistPenalty, edge: edge, mvp: p.mvp, hit: true };
+    if (p.mvp) return { id: id, name: p.name, inTeam: true, kind: 'mvp', points: CAPTAIN.bonusMultiple * Math.max(0, edge), edge: edge, mvp: true, hit: false };
+    return { id: id, name: p.name, inTeam: true, kind: 'notmvp', points: 0, edge: edge, mvp: false, hit: false };
   }
 
   /** Legality of a finished team (used by tests and the auction). */
@@ -259,7 +290,7 @@
   }
 
   return { scoreTeam: scoreTeam, synergyOf: synergyOf, validateTeam: validateTeam, index: idx, ATTR: ATTR, round1: round1,
-    budgetOf: budgetOf, classicRounds: classicRounds };
+    budgetOf: budgetOf, classicRounds: classicRounds, CAPTAIN: CAPTAIN };
 });
 
 /* ---- src/brain.js ---- */
@@ -648,13 +679,36 @@
     return { action: 'pass', reason: 'not needed', walk: w };
   }
 
+  /** Captain pick: the hire with the best expected captain points over every twist this problem could draw (the AI
+   *  never sees the real one). The Analyst weighs a possible doubled twist penalty 40% more; the Maverick backs its star. */
+  var CAPTAIN_STYLE = { standard: { risk: 1, star: 0 }, analyst: { risk: 1.4, star: 0 }, maverick: { risk: 0.85, star: 0.6 } };
+  function captainValues(game, side, styleName) {
+    var data = game.data, ch = game.challenge, t = game.teams[side];
+    if (!ch || !t.squad.length) return [];
+    var st = CAPTAIN_STYLE[styleName] || CAPTAIN_STYLE.standard;
+    var ids = t.squad.map(function (m) { return m.id; }), prices = t.squad.map(function (m) { return m.price; });
+    var tws = data.twists.filter(function (x) { return x.round === ch; });
+    return t.squad.map(function (m) {
+      var tot = 0, pts = 0;
+      tws.forEach(function (tw) { var o = {}; o[ch] = tw.id;
+        var r = engine.scoreTeam(data, ids, prices, o, { rounds: [ch], captain: m.id }), v = r.contributions.captain;
+        tot += v < 0 ? v * st.risk : v; pts += r.players.filter(function (p) { return p.id === m.id; })[0].points; });
+      return { id: m.id, value: tot / tws.length + (cand(game, m.id).isStar ? st.star : 0), expected: tot / tws.length, points: pts / tws.length };
+    });
+  }
+  function pickCaptain(game, side, styleName) {
+    var vals = captainValues(game, side, styleName || (game.controllers[side] === 'ai' ? (game.personas && game.personas[side]) || 'standard' : 'standard'));
+    vals.sort(function (a, b) { return b.value - a.value || b.points - a.points; });
+    return vals.length ? vals[0].id : null;
+  }
+
   function delay(game, opening) {
     var hi = CONFIG.delayMax;
     if (opening) hi = Math.min(hi, game.data.settings.fastSkip - CONFIG.openDelayMarginSec);
     return game.aiRng.float(CONFIG.delayMin, Math.max(CONFIG.delayMin, hi));
   }
 
-  return { CONFIG: CONFIG, PERSONAS: PERSONAS, persona: persona, baseWalk: baseWalk, walkAway: walkAway, classicWalk: classicWalk, decide: decide, delay: delay, isWanted: isWanted, humanTight: humanTight };
+  return { pickCaptain: pickCaptain, captainValues: captainValues, CONFIG: CONFIG, PERSONAS: PERSONAS, persona: persona, baseWalk: baseWalk, walkAway: walkAway, classicWalk: classicWalk, decide: decide, delay: delay, isWanted: isWanted, humanTight: humanTight };
 });
 
 /* ---- src/auction.js ---- */
@@ -712,10 +766,12 @@
       withdrawnStars: data.candidates.filter(function (c) { return c.isStar && stars.indexOf(c) < 0; }).map(function (c) { return c.id; }),
       queue: queue, pos: -1, phase: 'main', lastCallBuilt: false,
       teams: { human: { purse: budget, squad: [] }, ai: { purse: budget, squad: [] } },
+      captain: { human: null, ai: null }, captainAuto: { human: false, ai: false },
       sold: {}, unsold: [], log: [], events: [], pushLots: { human: [], ai: [] }, lot: null, lotsReached: 0, done: false, lastResult: null
     };
     game.aiPushLots = game.pushLots.ai;
     advance(game);
+    game.actions = [];   // every move from here on, so a finished game can be replayed and checked (leaderboard)
     return game;
   }
 
@@ -785,6 +841,7 @@
 
   /** Move to the next lot that at least one team can bid on. Handles last call, forced fill and the end. */
   function advance(game) {
+    if (game.actions) game.actions.push({ k: 'a' });
     game.lot = null;
     while (true) {
       if (openSeats(game, 'human') === 0 && openSeats(game, 'ai') === 0) { finish(game); return; }
@@ -832,6 +889,7 @@
     var lot = game.lot;
     lot.price = cb.price; lot.leader = side; lot.opened = true; lot.bidders[side] = true;
     lot.bids.push({ side: side, price: cb.price });
+    if (game.actions) game.actions.push({ k: 'b', s: side });
     if (meta && meta.push && !lot.pushed[side]) { lot.pushed[side] = true; game.pushLots[side].push(lot.id); if (side === 'ai') lot.aiPushed = true; }
     event(game, side, label(side, game) + ' ' + verb(game, side, 'bid', 'bids') + ' ₹' + cb.price + 'L', side === 'human' ? 'bid-h' : 'bid-a');
     return { ok: true, price: cb.price, result: check(game) };
@@ -842,6 +900,7 @@
     if (!lot || lot.closed || lot.withdrawn[side]) return { ok: false };
     if (lot.leader === side) return { ok: false, reason: 'The leader cannot withdraw' };
     lot.withdrawn[side] = true;
+    if (game.actions) game.actions.push({ k: 'p', s: side });
     event(game, side, label(side, game) + ' ' + verb(game, side, 'pass', 'passes'), 'pass');
     return { ok: true, result: check(game) };
   }
@@ -850,6 +909,7 @@
   function timeout(game) {
     var lot = game.lot;
     if (!lot || lot.closed) return null;
+    if (game.actions) game.actions.push({ k: 't' });
     return close(game, lot.opened ? lot.leader : null, lot.opened ? 'clock expired' : 'no opening bid in time');
   }
 
@@ -917,12 +977,21 @@
     SIDES.forEach(function (s) {
       var t = game.teams[s];
       out[s] = engine.scoreTeam(game.data, t.squad.map(function (m) { return m.id; }), t.squad.map(function (m) { return m.price; }), game.twists,
-        game.challenge ? { rounds: [game.challenge] } : null);
+        game.challenge ? { rounds: [game.challenge], captain: game.captain ? game.captain[s] : null } : null);
     });
     return out;
   }
 
-  return { createGame: createGame, canBid: canBid, eligible: eligible, nextPrice: nextPrice, increment: increment,
+  /** Pick a side's captain once the auction is over (one of its own hires). */
+  function setCaptain(game, side, id, auto) {
+    if (!game.done) return { ok: false, reason: 'The auction is still running' };
+    if (!game.teams[side].squad.some(function (m) { return m.id === id; })) return { ok: false, reason: 'Not in this squad' };
+    game.captain = game.captain || { human: null, ai: null }; game.captainAuto = game.captainAuto || { human: false, ai: false };
+    game.captain[side] = id; game.captainAuto[side] = !!auto;
+    return { ok: true };
+  }
+
+  return { setCaptain: setCaptain, createGame: createGame, canBid: canBid, eligible: eligible, nextPrice: nextPrice, increment: increment,
     bid: bid, pass: pass, timeout: timeout, advance: advance, openSeats: openSeats, fnCount: fnCount,
     starCount: starCount, scoreBoth: scoreBoth, other: other, label: label, MODES: MODES };
 });
@@ -968,6 +1037,7 @@
     var style = STRATEGIES[styleName] || STRATEGIES.balanced;
     var hr = RNG.make(seed + ':human');
     var game = A.createGame(data, seed, challenge ? { challenge: challenge } : null), steps = 0;
+    game._style = styleName;
     while (!game.done && steps++ < 5000) {
       var lot = game.lot;
       // opening: whoever wants it; if both, a coin flip decides who got there first
@@ -986,7 +1056,19 @@
       if (!lot.closed) A.timeout(game);
       A.advance(game);
     }
+    pickCaptains(game, hr);
     return game;
+  }
+  /** After the auction every side names a captain: AI sides by their own valuation; scripted people mostly the same,
+   *  the 'random' style any hire. */
+  function pickCaptains(game, rng, styles) {
+    if (!game.done || !game.challenge) return;
+    ['human', 'ai'].forEach(function (s) {
+      var sq = game.teams[s].squad; if (!sq.length) return;
+      var st = game.controllers[s] === 'ai' ? null : (styles ? styles[s] : (s === 'human' ? game._style : null));
+      var id = st === 'random' ? sq[Math.floor(rng.next() * sq.length)].id : AI.pickCaptain(game, s);
+      A.setCaptain(game, s, id);
+    });
   }
 
   /** Any mode, headless. AI-controlled sides use AI.decide (with their personality); person-controlled sides
@@ -1026,6 +1108,7 @@
       if (!lot.closed) A.timeout(game);
       A.advance(game);
     }
+    pickCaptains(game, rngs.human, { human: styles.human || 'balanced', ai: styles.ai || 'balanced' });
     return game;
   }
 
@@ -1116,7 +1199,8 @@
       { key: 'synergy', label: 'Team Synergy', h: H.contributions.synergy, a: A.contributions.synergy, hv: H.synergy.score, av: A.synergy.score },
       { key: 'budget', label: 'Budget Efficiency', h: H.contributions.budget, a: A.contributions.budget, hv: H.budget.efficiency, av: A.budget.efficiency },
       { key: 'risk', label: 'Risk / Adaptability', h: H.contributions.risk, a: A.contributions.risk, hv: H.risk, av: A.risk },
-      { key: 'friction', label: 'Friction', h: H.friction.total, a: A.friction.total, hv: H.friction.total, av: A.friction.total }
+      { key: 'friction', label: 'Friction', h: H.friction.total, a: A.friction.total, hv: H.friction.total, av: A.friction.total },
+      { key: 'captain', label: 'Captain', h: H.contributions.captain || 0, a: A.contributions.captain || 0, hv: H.contributions.captain || 0, av: A.contributions.captain || 0 }
     ];
     items.forEach(function (it) { it.gap = it.h - it.a; it.ahead = it.gap > 0 ? 'human' : it.gap < 0 ? 'ai' : null; });
     var gaps = items.filter(function (it) { return Math.abs(it.gap) > 0.0005; })
@@ -1139,6 +1223,9 @@
             '); ' + nm.ai + ' paid ' + money(A.budget.hammer) + ' for ' + money(A.budget.benchmark) + ' (' + pct(A.budget.hammer / A.budget.benchmark) + ').';
         } else if (it.key === 'risk') {
           text = 'Average Adaptability + Resilience: ' + nm.human + ' ' + f1(H.risk) + ' vs ' + nm.ai + ' ' + f1(A.risk) + ' (0–100 scale).';
+        } else if (it.key === 'captain') {
+          var cw = function (S) { var c = S.captain; return !c ? 'none' : c.kind === 'mvp' ? (c.name + ' was MVP, +' + f1(c.points)) : c.kind === 'hit' ? (c.name + ' hit by the twist, ' + f1(c.points)) : c.kind === 'released' ? 'released, 0' : (c.name + ' not MVP, 0'); };
+          text = 'Captain – ' + nm.human + ': ' + cw(H) + '; ' + nm.ai + ': ' + cw(A) + '.';
         } else {
           var lst = function (S) { var t = S.friction.rules.filter(function (r) { return r.penalty !== 0; }); return t.length ? t.map(function (r) { return r.id + ' ' + r.name + ' (' + r.penalty + ')'; }).join(', ') : 'none'; };
           text = 'Friction – ' + nm.human + ': ' + lst(H) + '; ' + nm.ai + ': ' + lst(A) + '.';
@@ -1148,6 +1235,7 @@
         else if (it.key === 'synergy') short = H.synergy.pairs.filter(function (p) { return p.active; }).length + ' vs ' + A.synergy.pairs.filter(function (p) { return p.active; }).length + ' linked function pairs';
         else if (it.key === 'budget') short = 'Paid ' + pct(H.budget.hammer / H.budget.benchmark) + ' vs ' + pct(A.budget.hammer / A.budget.benchmark) + ' of benchmark';
         else if (it.key === 'risk') short = 'Adaptability ' + f1(H.risk) + ' vs ' + f1(A.risk);
+        else if (it.key === 'captain') short = 'Captain ' + f1(H.contributions.captain || 0) + ' vs ' + f1(A.contributions.captain || 0);
         else short = 'Friction ' + H.friction.total + ' vs ' + A.friction.total;
         return { key: it.key, label: it.label, ahead: it.ahead, short: short, aheadLabel: lead, human: it.hv, ai: it.av, gap: it.gap, text: text,
           headline: lead + ' gained ' + f1(Math.abs(it.gap)) + ' final-score points on ' + it.label + '.' };
@@ -1295,7 +1383,8 @@
     { key: 'twist', label: 'Twist damage', icon: 'bolt', blurb: 'Points lost to the surprise twist' },
     { key: 'budget', label: 'Budget efficiency', icon: 'coin', blurb: 'Price discipline and value per rupee' },
     { key: 'risk', label: 'Adaptability', icon: 'shield', blurb: 'Average Adaptability + Resilience' },
-    { key: 'friction', label: 'Friction', icon: 'warn', blurb: 'Direct penalties for clashing traits' }
+    { key: 'friction', label: 'Friction', icon: 'warn', blurb: 'Direct penalties for clashing traits' },
+    { key: 'captain', label: 'Captain', icon: 'crown', blurb: 'Double the edge if the captain is the MVP; twist penalty again if hit' }
   ];
 
   function build(data, game, sc) {
@@ -1337,7 +1426,8 @@
       twist: cp.twist,
       budget: w.contributions.budget - l.contributions.budget,
       risk: w.contributions.risk - l.contributions.risk,
-      friction: w.friction.total - l.friction.total
+      friction: w.friction.total - l.friction.total,
+      captain: (w.contributions.captain || 0) - (l.contributions.captain || 0)
     };
     var ledger = FACTORS.map(function (f) {
       var p = pts[f.key];
@@ -1460,6 +1550,13 @@
         var sA = squads[A].slice().sort(function (x, y) { return y.adaptRes - x.adaptRes; })[0], sB = squads[B].slice().sort(function (x, y) { return x.adaptRes - y.adaptRes; })[0];
         had = 'Adaptability + Resilience averaged ' + f1(risk[A]) + '; ' + sA.name + ' led at ' + f1(sA.adaptRes * 10);
         missed = 'Averaged ' + f1(risk[B]) + '; ' + sB.name + ' was lowest at ' + f1(sB.adaptRes * 10);
+      } else if (key === 'captain') {
+        var cDesc = function (s) { var c = sc[s].captain; if (!c) return 'No captain named';
+          return c.kind === 'mvp' ? 'Captain ' + c.name + ' finished as the team MVP: double their edge, +' + f1(c.points)
+            : c.kind === 'hit' ? 'Captain ' + c.name + ' was hit by the twist: twist penalty x2, ' + f1(c.points)
+            : c.kind === 'released' ? 'Captain released in the transfer window: no captain points'
+            : 'Captain ' + c.name + ' was not the team MVP: no bonus'; };
+        had = cDesc(A); missed = cDesc(B);
       } else if (key === 'friction') {
         had = friction[A].filter(function (r) { return r.penalty !== 0; }).length ? 'Smaller penalty: ' + friction[A].filter(function (r) { return r.penalty !== 0; }).map(function (r) { return r.name + ' ' + r.penalty; }).join(', ') : 'No friction penalties';
         missed = friction[B].filter(function (r) { return r.penalty !== 0; }).map(function (r) { return r.name + ' (' + r.penalty + '): ' + r.detail; }).join('; ') || 'Friction penalty';
@@ -1536,9 +1633,9 @@
   function fee(c) { return Math.ceil(c.benchmark * CONFIG.feeOfBenchmark); }
   function refund(m) { return Math.round(m.price * CONFIG.refundShare * 10) / 10; }
 
-  function score(data, game, squad) {
+  function score(data, game, squad, side) {
     return engine.scoreTeam(data, squad.map(function (m) { return m.id; }), squad.map(function (m) { return m.price; }), game.twists,
-      game.challenge ? { rounds: [game.challenge] } : null);
+      game.challenge ? { rounds: [game.challenge], captain: game.captain ? game.captain[side] : null } : null);
   }
   /** Candidates nobody owns: unsold regulars and offered stars that went unsold (not the star withdrawn before the auction). */
   function pool(data, game) {
@@ -1587,7 +1684,7 @@
 
   /** Every legal, affordable one-for-one swap for `side`, best first. */
   function options(data, game, side) {
-    var I = engine.index(data), t = game.teams[side], before = score(data, game, t.squad), list = [];
+    var I = engine.index(data), t = game.teams[side], before = score(data, game, t.squad, side), list = [];
     pool(data, game).forEach(function (inId) {
       var inC = I.byId[inId], price = fee(inC);
       t.squad.forEach(function (m, i) {
@@ -1595,7 +1692,7 @@
         if (purseAfter < -1e-9) return;
         var squad = t.squad.slice(); squad[i] = { id: inId, price: price, lotNo: null, transfer: true };
         if (!legal(data, squad)) return;
-        var after = score(data, game, squad);
+        var after = score(data, game, squad, side);
         list.push({ side: side, out: m.id, outName: I.byId[m.id].name, outPrice: m.price, refund: refund(m), in: inId, inName: inC.name, price: price,
           purseAfter: purseAfter, before: before.final, after: after.final, gain: after.final - before.final,
           reasons: reasons(data, before, after, I.byId[m.id], inC) });
@@ -1978,6 +2075,88 @@
     joinLink: joinLink, codeFromLink: codeFromLink, peerOptions: peerOptions, useMemory: useMemory, useNone: useNone };
 });
 
+/* ---- src/verify.js ---- */
+/* Talent Auction – replay check for the leaderboard.
+ * A finished Human vs AI game is sent as a small record: the seed, the problem, every move in order
+ * (bids, passes, clock run-outs, next-lot), the captain and the transfer. check() rebuilds the game from the
+ * seed, replays every move, and requires that each AI move is exactly what the AI would have done at that
+ * moment (and that the clock never ran out while the AI still wanted to bid). The score is then computed
+ * again with the same pure engine, so a submitted score cannot be faked. Pure: no randomness, no I/O. */
+(function (root, factory) {
+  var isNode = typeof module === 'object' && module.exports;
+  var mod = isNode ? factory(require('./engine.js'), require('./auction.js'), require('./ai.js'), require('./transfer.js'))
+                   : factory(root.TA.engine, root.TA.auction, root.TA.ai, root.TA.transfer);
+  if (isNode) module.exports = mod; else { root.TA = root.TA || {}; root.TA.verify = mod; }
+})(typeof self !== 'undefined' ? self : this, function (engine, A, AI, X) {
+  'use strict';
+  var LIMITS = { maxActions: 4000 };
+
+  /** The record a client sends for a finished Human vs AI game. */
+  function record(game, appVersion) {
+    var tr = (game.transfers || []).filter(function (t) { return t.side === 'human'; })[0] || null;
+    var sc = A.scoreBoth(game);
+    return { v: 1, app: appVersion || '', data: game.data.meta && game.data.meta.generatedAt, mode: game.mode, problem: game.challenge, seed: game.seed,
+      actions: (game.actions || []).map(function (a) { return a.k + (a.s ? (a.s === 'human' ? 'h' : 'a') : ''); }).join(''),
+      captain: game.captain ? game.captain.human : null, transfer: tr ? { out: tr.out, in: tr.in } : null,
+      final: Math.round(sc.human.final * 1000) / 1000 };
+  }
+
+  function fail(why) { return { ok: false, why: why }; }
+
+  /** Replay a record and return the verified result (or why it was refused). */
+  function check(data, rec) {
+    if (!rec || rec.v !== 1) return fail('Unknown record format');
+    if (rec.mode !== 'hva') return fail('Only Human vs AI games count for the leaderboard');
+    if (data.meta && rec.data !== data.meta.generatedAt) return fail('The game was updated since this match. Play a new game to submit a score.');
+    var rd = data.rounds.filter(function (r) { return r.id === rec.problem; })[0];
+    if (!rd) return fail('Unknown problem');
+    if (typeof rec.seed !== 'string' || !/^[A-Z0-9-]{1,24}$/.test(rec.seed)) return fail('Bad seed');
+    var acts = String(rec.actions || '');
+    if (!/^(a|t|bh|ba|ph|pa)*$/.test(acts) || acts.length > LIMITS.maxActions * 2) return fail('Bad move list');
+    var moves = acts.match(/a|t|bh|ba|ph|pa/g) || [];
+    var g = A.createGame(data, rec.seed, { challenge: rec.problem, mode: 'hva' });
+    g.actions = null;   // replaying, not recording
+    for (var i = 0; i < moves.length; i++) {
+      var m = moves[i], k = m[0], side = m[1] === 'h' ? 'human' : 'ai';
+      if (k === 'a') { if (g.done) return fail('Move after the end (' + i + ')'); A.advance(g); continue; }
+      var lot = g.lot;
+      if (g.done || !lot || lot.closed) return fail('No open lot at move ' + i);
+      if (k === 't') {
+        var cb = A.canBid(g, 'ai');
+        if (cb.ok && !lot.withdrawn.ai && lot.leader !== 'ai' && AI.decide(g, A, 'ai').action === 'bid') return fail('The clock cannot run out while the AI still wants to bid (move ' + i + ')');
+        A.timeout(g); continue;
+      }
+      if (side === 'ai') {
+        var d = AI.decide(g, A, 'ai');
+        if ((k === 'b') !== (d.action === 'bid')) return fail('That is not what the AI would have done (move ' + i + ')');
+        var r = k === 'b' ? A.bid(g, 'ai', d) : A.pass(g, 'ai');
+        if (!r.ok) return fail('Illegal AI move ' + i);
+      } else {
+        var rh = k === 'b' ? A.bid(g, 'human') : A.pass(g, 'human');
+        if (!rh.ok) return fail('Illegal move ' + i);
+      }
+    }
+    if (!g.done) return fail('The auction did not finish');
+    // captains: the AI picks its own; the player's pick (or the coach's pick when there was none)
+    A.setCaptain(g, 'ai', AI.pickCaptain(g, 'ai'));
+    if (rec.captain) { if (!A.setCaptain(g, 'human', rec.captain).ok) return fail('Captain not in the squad'); }
+    else A.setCaptain(g, 'human', AI.pickCaptain(g, 'human', 'standard'), true);
+    // transfer window: the player first, then the AI's own move
+    if (rec.transfer) {
+      var sw = X.options(data, g, 'human').swaps.filter(function (s) { return s.out === rec.transfer.out && s.in === rec.transfer.in; })[0];
+      if (!sw) return fail('That transfer was not possible');
+      X.apply(data, g, sw);
+    }
+    var ai = X.aiPick(data, g, 'ai'); if (ai) X.apply(data, g, ai);
+    var sc = A.scoreBoth(g), H = sc.human, AIs = sc.ai;
+    if (typeof rec.final === 'number' && Math.abs(rec.final - H.final) > 0.01) return fail('The score does not match the replay');
+    return { ok: true, problem: rec.problem, budget: g.budget, seed: rec.seed, final: H.final, ai: AIs.final, won: H.final > AIs.final + 1e-9, margin: H.final - AIs.final,
+      captain: H.captain ? H.captain.kind : null, moves: moves.length };
+  }
+
+  return { record: record, check: check, LIMITS: LIMITS };
+});
+
 /* ---- src/selftest.js ---- */
 /* Talent Auction – acceptance tests, shared by Node (tests/run_tests.js) and the in-game Test panel. */
 (function (root, factory) {
@@ -1987,6 +2166,7 @@
   if (isNode) module.exports = mod; else { root.TA = root.TA || {}; root.TA.selftest = mod; }
 })(typeof self !== 'undefined' ? self : this, function (engine, sim, A, D, R, X, PM) {
   'use strict';
+  function root_verify() { return (typeof module === 'object' && module.exports) ? require('./verify.js') : (typeof self !== 'undefined' ? self : this).TA.verify; }
   function root_ai() { return (typeof self !== 'undefined' ? self : this).TA.ai; }
   var TOL = 0.0005;
   var SCORING = [
@@ -2069,6 +2249,31 @@
     out.push({ name: 'Companies: 3 companies × 3 problems; each problem sets both purses and the scoring to its own budget',
       pass: coOk && !coBad.length && !!engine.budgetOf && engine.budgetOf(data, null) === S.budget,
       detail: coBad.length ? coBad.join(', ') : 'budgets ' + data.rounds.map(function (rd) { return rd.id + ' ₹' + rd.budget + 'L'; }).join(' · ') + (tight.length ? ' · no star affordable in ' + tight.join(', ') : '') });
+    // captain: hire points add up to the round's skill part; MVP captain doubles the edge, a hit captain pays the twist penalty x2, released = 0
+    var capBad = [], capN = 0, kinds = {};
+    data.rounds.forEach(function (rd, ri) {
+      var tws = data.twists.filter(function (t) { return t.round === rd.id; });
+      for (var k = 0; k < 6; k++) {
+        var ids = [], used = {}, at = (k * 17 + ri * 5) % data.candidates.length;
+        while (ids.length < S.seats) { var cc = data.candidates[at % data.candidates.length]; if (!used[cc.id]) { used[cc.id] = 1; ids.push(cc.id); } at += 7; }
+        var prices = ids.map(function (id, i) { return 12 + i * 5; }), tm = {}; tm[rd.id] = tws[k % tws.length].id;
+        var base = engine.scoreTeam(data, ids, prices, tm, { rounds: [rd.id] }), R0 = base.rounds[0];
+        var sumPts = base.players.reduce(function (a, p) { return a + p.points; }, 0);
+        if (Math.abs(sumPts - S.wChallenge * (R0.raw - rd.synergyWeight * base.synergy.score - R0.penalty)) > 1e-9) capBad.push(rd.id + ' points sum');
+        ids.concat(['ZZZ']).forEach(function (cid) {
+          var r = cid === 'ZZZ' ? engine.scoreTeam(data, ids, prices, tm, { rounds: [rd.id], captain: 'X99' }) : engine.scoreTeam(data, ids, prices, tm, { rounds: [rd.id], captain: cid });
+          var p = base.players.filter(function (x) { return x.id === cid; })[0], c = r.captain, want;
+          if (!p) want = 0; else if (p.hit) want = -2 * p.twistPenalty; else if (p.mvp) want = 2 * (p.points - base.teamAvg); else want = 0;
+          capN++; kinds[c.kind] = (kinds[c.kind] || 0) + 1;
+          if (Math.abs(c.points - want) > 1e-9 || Math.abs(r.final - base.final - want) > 1e-9) capBad.push(rd.id + ' ' + cid + ' ' + c.kind);
+        });
+      }
+    });
+    var capGames = 0;
+    data.rounds.forEach(function (rd) { var gc = sim.playMatch(data, 'QA-CAP-' + rd.id, { mode: 'ava', challenge: rd.id });
+      ['human', 'ai'].forEach(function (sd) { capGames++; if (!gc.captain[sd] || !gc.teams[sd].squad.some(function (m) { return m.id === gc.captain[sd]; })) capBad.push(rd.id + ' ' + sd + ' AI captain'); }); });
+    out.push({ name: 'Captain: hire points add up to the skill score; MVP captain = 2 x edge, hit captain = twist penalty x2, released = 0; every AI names a legal captain',
+      pass: !capBad.length, detail: capBad.length ? capBad.slice(0, 4).join(' | ') : capN + ' captain cases (' + Object.keys(kinds).map(function (x) { return x + ' ' + kinds[x]; }).join(', ') + '), ' + capGames + ' AI picks' });
     // the AI's planning brain scores teams exactly as the engine does (every problem, every twist)
     var BR = (typeof module === 'object' && module.exports) ? require('./brain.js') : (typeof self !== 'undefined' ? self : this).TA.brain;
     var bErr = 0, bN = 0, ncand = data.candidates.length;
@@ -2158,6 +2363,22 @@
     });
     out.push({ name: 'What went wrong: twist and friction points blamed on hires add up to what the engine deducted; every twist victim is named',
       pass: !pBad.length, detail: pBad.length ? pBad.slice(0, 3).join(' | ') : pN + ' hires analysed, ' + pUnder + ' underperformed' });
+    // leaderboard: every recorded Human vs AI game replays to the same score; edited records are refused
+    var V = root_verify(), vOk = 0, vN = 0, vBad = [], styles = Object.keys(sim.STRATEGIES);
+    for (var vi = 0; vi < 27; vi++) {
+      var vg = sim.playGame(data, 'LB' + vi, styles[vi % styles.length], data.rounds[vi % data.rounds.length].id);
+      if (vi % 3 === 0) { var vo = X.options(data, vg, 'human').swaps; if (vo.length) X.apply(data, vg, vo[vi % vo.length]); }
+      var vx = X.aiPick(data, vg, 'ai'); if (vx) X.apply(data, vg, vx);
+      var rec = V.record(vg, 'test'), vc = V.check(data, rec); vN++;
+      if (vc.ok && Math.abs(vc.final - A.scoreBoth(vg).human.final) < 1e-9) vOk++; else vBad.push(vg.seed + ' ' + (vc.why || 'score differs'));
+      if (vi < 3) {
+        var tamper = [function (x) { x.final += 1; }, function (x) { x.actions = x.actions.replace('ba', 'pa'); }, function (x) { x.actions = x.actions.slice(0, -6); },
+          function (x) { x.captain = 'NOPE'; }, function (x) { x.actions = x.actions.replace(/ba/g, ''); }, function (x) { x.mode = 'hvh'; }];
+        tamper.forEach(function (f, k) { var x = JSON.parse(JSON.stringify(rec)); f(x); if (V.check(data, x).ok) vBad.push(vg.seed + ' tamper ' + k + ' accepted'); });
+      }
+    }
+    out.push({ name: 'Leaderboard: ' + vN + ' recorded games replay to exactly the same score; edited records (score, AI moves, cut moves, captain, mode) are refused',
+      pass: !vBad.length && vOk === vN, detail: vBad.length ? vBad.slice(0, 3).join(' | ') : vOk + '/' + vN + ' verified, 18 tampered records refused' });
     return { tests: out, stats: st };
   }
 
