@@ -54,11 +54,7 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  var ATTR = {
-    FE: 'Functional Expertise', EXEC: 'Execution', COMM: 'Communication', LEAD: 'Leadership',
-    ADAPT: 'Adaptability', INNO: 'Innovation / Creativity', CUST: 'Customer Orientation',
-    COMM_AC: 'Commercial Acumen', RES: 'Resilience'
-  };
+  var ATTR = { ANALYTICAL: 'Analytical', COMMERCIAL: 'Commercial', EXEC: 'Execution', TECH: 'Technical', LEAD: 'Leadership', ADAPT: 'Adaptability' };
 
   var cache = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
   function idx(data) {
@@ -80,10 +76,11 @@
 
   /** Synergy for a list of function names (pairs counted once). */
   function synergyOf(data, fnList) {
-    var S = data.settings, present = {};
-    fnList.forEach(function (f) { present[f] = true; });
+    var S = data.settings, count = {};
+    fnList.forEach(function (f) { count[f] = (count[f] || 0) + 1; });
     var pairs = data.synergy.map(function (p) {
-      return { a: p.a, b: p.b, bonus: p.bonus, logic: p.logic, active: !!(present[p.a] && present[p.b]) };
+      var on = p.a === p.b ? (count[p.a] || 0) >= 2 : !!(count[p.a] && count[p.b]);
+      return { a: p.a, b: p.b, bonus: p.bonus, logic: p.logic, active: on };
     });
     var raw = sum(pairs.filter(function (p) { return p.active; }).map(function (p) { return p.bonus; }));
     var capped = Math.min(raw, S.synergyCap);
@@ -113,47 +110,45 @@
     return twists || {};
   }
 
-  function frictionOf(data, members, hammerTotal, stars, budget) {
-    var S = data.settings;
+  /** Friction: penalties from how the team is made up (v4 rules; no personality labels). */
+  function frictionOf(data, members, hammerTotal, stars, budget, roundList) {
     var A = function (name) { return members.map(function (m) { return m.c.attrs[name]; }); };
-    var maxF2 = Math.max.apply(null, [0].concat(stars.map(function (s) { return s.f2Offset; })));
+    var comp = function (code) { return members.map(function (m) { return m.c.comp[code] || 0; }); };
     return data.friction.map(function (r) {
-      var trig = false, detail = '', mult = 1, who = [];
+      var trig = false, detail = '', who = [];
       switch (r.id) {
         case 'F1':
-          who = members.filter(function (m) { return m.c.ego; });
-          trig = who.length >= r.p1; detail = who.length + ' ego-flagged member(s)'; break;
+          var md = Math.max.apply(null, [0].concat(comp('DAT')));
+          trig = md < r.p1; detail = 'best SQL / Data Analytics ' + md; break;
         case 'F2':
-          who = members.filter(function (m) { return m.c.attrs[ATTR.FE] >= r.p1 && m.c.attrs[ATTR.COMM] <= r.p2; });
-          trig = who.length >= r.p3; mult = 1 - maxF2;
-          detail = who.length + ' deep specialist(s) with Communication ≤ ' + r.p2 + (trig && mult < 1 ? ' – offset by an active Crisis General' : ''); break;
+          who = members.filter(function (m) { return m.c.attrs[ATTR.COMMERCIAL] <= r.p1; });
+          trig = who.length >= r.p2; detail = who.length + ' member(s) with Commercial ≤ ' + r.p1; break;
         case 'F3':
-          var ai = avg(A(ATTR.INNO)), ae = avg(A(ATTR.EXEC));
-          trig = ai >= r.p1 && ae < r.p2; detail = 'avg Innovation ' + ai.toFixed(1) + ', avg Execution ' + ae.toFixed(1); break;
+          var ae = avg(A(ATTR.EXEC));
+          trig = ae < r.p1; detail = 'avg Execution ' + ae.toFixed(1); break;
         case 'F4':
-          var ac = avg(A(ATTR.COMM_AC));
+          var ac = avg(A(ATTR.COMMERCIAL));
           trig = hammerTotal > r.p1 * budget && ac < r.p2;
-          detail = 'spend ₹' + round1(hammerTotal) + 'L vs ' + Math.round(r.p1 * 100) + '% of budget, avg Commercial Acumen ' + ac.toFixed(1); break;
+          detail = 'spend ₹' + round1(hammerTotal) + 'L vs ' + Math.round(r.p1 * 100) + '% of budget, avg Commercial ' + ac.toFixed(1); break;
         case 'F5':
-          var cf = members.filter(function (m) { return r.functions.indexOf(m.c.function) >= 0; });
-          var co = avg(A(ATTR.CUST));
-          trig = cf.length === 0 && co < r.p1; detail = cf.length + ' customer-facing member(s), avg Customer Orientation ' + co.toFixed(1); break;
+          var miss = (roundList || []).filter(function (rd) { return !members.some(function (m) { return (rd.highRelevance || []).indexOf(m.c.function) >= 0; }); });
+          trig = miss.length > 0; detail = trig ? 'nobody from ' + miss[0].highRelevance.join(' / ') : 'core function covered'; break;
         case 'F6':
           who = members.filter(function (m) { return m.c.experience <= r.p1; });
           var ml = Math.max.apply(null, A(ATTR.LEAD));
           trig = who.length >= r.p2 && ml < r.p3; detail = who.length + ' junior(s), top Leadership ' + ml; break;
         default: trig = false;
       }
-      var pen = trig ? r.penalty * mult : 0;
+      var pen = trig ? r.penalty : 0;
       if (pen === 0) pen = 0; // normalise -0
       return { id: r.id, name: r.name, why: r.why, triggered: trig, penalty: pen, basePenalty: r.penalty,
-        cancelled: trig && mult < 1, detail: detail, members: who.map(function (m) { return m.c.id; }) };
+        cancelled: false, detail: detail, members: trig ? who.map(function (m) { return m.c.id; }) : [] };
     });
   }
 
   function round1(x) { return Math.round(x * 10) / 10; }
 
-  /** The rounds of the classic three-round evaluation (NovaBite's three problems). */
+  /** The rounds of the classic three-round evaluation (the first company's three problems, C1–C3). */
   function classicRounds(data) {
     var ids = data.meta && data.meta.classicRounds;
     return ids ? data.rounds.filter(function (r) { return ids.indexOf(r.id) >= 0; }) : data.rounds;
@@ -232,8 +227,8 @@
     var refRate = S.referenceChallenge / (S.referenceSpendShare * budget);
     var vpr = hammer > 0 ? Math.min(100, 50 * (challenge / hammer) / refRate) : 100;
     var be = 0.5 * pd + 0.5 * vpr;
-    var risk = avg(members.map(function (m) { return (m.c.attrs[ATTR.ADAPT] + m.c.attrs[ATTR.RES]) / 2 * 10; }));
-    var fr = frictionOf(data, members, hammer, stars, budget);
+    var risk = avg(members.map(function (m) { return m.c.attrs[ATTR.ADAPT] * 10; }));
+    var fr = frictionOf(data, members, hammer, stars, budget, roundList);
     var frTotal = sum(fr.map(function (f) { return f.penalty; }));
     // hire points averaged over the rounds played; the team MVP is the hire with the most points
     var players = members.map(function (m, i) {
@@ -289,7 +284,45 @@
     return issues;
   }
 
-  return { scoreTeam: scoreTeam, synergyOf: synergyOf, validateTeam: validateTeam, index: idx, ATTR: ATTR, round1: round1,
+  /** The game as it is played for one problem. v4 data marks stars per problem (candidate.starIn): in that
+   *  problem those candidates are the marquee stars, and the auction offers them plus the regulars that fit the
+   *  problem best (settings.lotsPerGame lots), in 5 sets mixed by fit. Older data (no starIn) is returned unchanged. */
+  var viewCache = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+  function view(data, roundId) {
+    if (!data || !roundId || (data.meta && data.meta.view) || !data.candidates.some(function (c) { return c.starIn; })) return data;
+    var store = viewCache && viewCache.get(data);
+    if (!store) { store = {}; if (viewCache) viewCache.set(data, store); }
+    if (store[roundId]) return store[roundId];
+    var S = data.settings, nLots = S.lotsPerGame || data.candidates.length;
+    var isStar = function (c) { return (c.starIn || []).indexOf(roundId) >= 0; };
+    var regs = data.candidates.filter(function (c) { return !isStar(c); })
+      .sort(function (a, b) { return b.fit[roundId] - a.fit[roundId] || (a.id < b.id ? -1 : 1); });
+    var nStars = data.candidates.filter(isStar).length, setOf = {};
+    var rd = (data.rounds || []).filter(function (r) { return r.id === roundId; })[0] || {};
+    if (rd.lots) rd.lots.forEach(function (l) { if (l.set !== 'Marquee') setOf[l.id] = l.set; });   // lots chosen by the data build (core quotas, affordable fillers)
+    else regs.slice(0, Math.max(0, nLots - nStars)).forEach(function (c, i) { setOf[c.id] = 'Core Set ' + (i % 5 + 1); });
+    var prem = rd.starPrices || {};   // star premium: in its problem a star asks a share of the budget
+    var cands = data.candidates.map(function (c) {
+      var st = isStar(c), p = st && prem[c.id];
+      return Object.assign({}, c, { isStar: st, tier: st ? 'Marquee' : 'Core', auctionSet: st ? 'Marquee' : (setOf[c.id] || null),
+        marketNote: st ? 'Marquee star' : c.marketNote, inAuction: st || !!setOf[c.id] },
+        p ? { benchmark: p.benchmark, startingBid: p.startingBid, basePrice: c.benchmark } : {});
+    });
+    var lots = cands.filter(function (c) { return c.isStar; }).map(function (c) { return { set: 'Marquee', id: c.id }; })
+      .concat(cands.filter(function (c) { return !c.isStar && c.auctionSet; }).sort(function (a, b) { return a.auctionSet < b.auctionSet ? -1 : a.auctionSet > b.auctionSet ? 1 : 0; })
+        .map(function (c) { return { set: c.auctionSet, id: c.id }; }));
+    var v = Object.assign({}, data, {
+      meta: Object.assign({}, data.meta, { view: roundId }),
+      settings: Object.assign({}, S, { starsOffered: nStars }),
+      candidates: cands,
+      stars: data.stars.filter(function (st) { return (st.rounds || []).indexOf(roundId) >= 0; }),
+      lotOrder: lots.map(function (l, i) { return { lot: i + 1, set: l.set, id: l.id }; })
+    });
+    store[roundId] = v;
+    return v;
+  }
+
+  return { scoreTeam: scoreTeam, view: view, synergyOf: synergyOf, validateTeam: validateTeam, index: idx, ATTR: ATTR, round1: round1,
     budgetOf: budgetOf, classicRounds: classicRounds, CAPTAIN: CAPTAIN };
 });
 
@@ -348,16 +381,15 @@
       if (st) { codes.forEach(function (k) { boost += rd.weights[k] * st.effects[roundId][k]; }); st.linked.forEach(function (f) { linked |= 1 << fnIdx[f]; }); }
       var fit = 0, ws = 0; codes.forEach(function (k) { fit += rd.weights[k] * c.comp[k]; ws += rd.weights[k]; });
       return { i: i, id: c.id, c: c, fn: fnIdx[c.function], rel: I.rel[c.function][roundId], a: a, star: !!st, boost: boost, linked: linked,
-        cancelsF2: st ? st.cancelsF2 : 0, ego: c.ego ? 1 : 0, fe: A(c, 'Functional Expertise'), comm: A(c, 'Communication'),
-        inno: A(c, 'Innovation / Creativity'), exec: A(c, 'Execution'), comAc: A(c, 'Commercial Acumen'), cust: A(c, 'Customer Orientation'),
-        lead: A(c, 'Leadership'), exp: c.experience, risk: (A(c, 'Adaptability') + A(c, 'Resilience')) / 2 * 10,
+        cancelsF2: 0, exec: A(c, 'Execution'), com: A(c, 'Commercial'), dat: c.comp.DAT || 0,
+        lead: A(c, 'Leadership'), exp: c.experience, risk: A(c, 'Adaptability') * 10,
         bench: c.benchmark, start: c.startingBid, sev: c.riskSeverity,
         hit: twists.map(function (t) { return t.hits.indexOf(c.riskCode) >= 0; }), cover: twists.map(function (t) { return c.comp[t.cover]; }),
         fit: ws ? fit / ws * 10 : 0 };
     });
     var byId = {}; C.forEach(function (x) { byId[x.id] = x; });
     var fr = {}; data.friction.forEach(function (r) { fr[r.id] = r; });
-    var customerMask = 0; (fr.F5 ? fr.F5.functions : []).forEach(function (f) { customerMask |= 1 << fnIdx[f]; });
+    var customerMask = 0; (rd.highRelevance || []).forEach(function (f) { if (fnIdx[f] !== undefined) customerMask |= 1 << fnIdx[f]; });
     var ctx = { data: data, S: S, rd: rd, roundId: roundId, budget: budget, C: C, byId: byId, syn: syn, nFn: fnNames.length,
       twists: twists, thr: twists.map(function (t) { return t.threshold; }), fr: fr, customerMask: customerMask,
       refRate: S.referenceChallenge / (S.referenceSpendShare * budget) };
@@ -370,11 +402,11 @@
     var S = ctx.S, n = team.length, i, j, t;
     if (!n) return { mean: 0, finals: [], penalty: 0 };
     var relSum = 0, relA = 0, fnMask = 0, hammer = 0, bench = 0, risk = 0, starPerf = 0, maxF2 = 0, activeStars = 0;
-    var ego = 0, spec = 0, inno = 0, exec = 0, comAc = 0, cust = 0, juniors = 0, maxLead = 0;
+    var spec = 0, exec = 0, com = 0, maxDat = 0, juniors = 0, maxLead = 0, fnCnt = new Array(ctx.nFn).fill(0);
     var fr = ctx.fr;
     for (i = 0; i < n; i++) {
-      var x = team[i].x; relSum += x.rel; relA += x.rel * x.a; fnMask |= 1 << x.fn; hammer += team[i].price; bench += x.bench; risk += x.risk;
-      ego += x.ego; if (fr.F2 && x.fe >= fr.F2.p1 && x.comm <= fr.F2.p2) spec++; inno += x.inno; exec += x.exec; comAc += x.comAc; cust += x.cust;
+      var x = team[i].x; relSum += x.rel; relA += x.rel * x.a; fnMask |= 1 << x.fn; fnCnt[x.fn]++; hammer += team[i].price; bench += x.bench; risk += x.risk;
+      if (fr.F2 && x.com <= fr.F2.p1) spec++; exec += x.exec; com += x.com; if (x.dat > maxDat) maxDat = x.dat;
       if (fr.F6 && x.exp <= fr.F6.p1) juniors++; if (x.lead > maxLead) maxLead = x.lead;
     }
     for (i = 0; i < n; i++) {
@@ -385,16 +417,16 @@
     }
     // synergy: every data pair whose two functions are both present, counted once
     var synRaw = 0;
-    for (i = 0; i < ctx.nFn; i++) if ((fnMask >> i) & 1) for (j = i; j < ctx.nFn; j++) if ((fnMask >> j) & 1 && ctx.syn[i][j]) synRaw += i === j ? 0 : ctx.syn[i][j];
+    for (i = 0; i < ctx.nFn; i++) if ((fnMask >> i) & 1) for (j = i; j < ctx.nFn; j++) if ((fnMask >> j) & 1 && ctx.syn[i][j]) synRaw += i === j ? (fnCnt[i] >= 2 ? ctx.syn[i][j] : 0) : ctx.syn[i][j];
     var synScore = Math.min(synRaw, S.synergyCap) / S.synergyCap * 100;
     var raw = 10 * (relA / relSum + starPerf) + ctx.rd.synergyWeight * synScore;
     // friction (direct points)
     var fric = 0;
-    if (fr.F1 && ego >= fr.F1.p1) fric += fr.F1.penalty;
-    if (fr.F2 && spec >= fr.F2.p3) fric += fr.F2.penalty * (1 - maxF2);
-    if (fr.F3 && inno / n >= fr.F3.p1 && exec / n < fr.F3.p2) fric += fr.F3.penalty;
-    if (fr.F4 && hammer > fr.F4.p1 * ctx.budget && comAc / n < fr.F4.p2) fric += fr.F4.penalty;
-    if (fr.F5 && !(fnMask & ctx.customerMask) && cust / n < fr.F5.p1) fric += fr.F5.penalty;
+    if (fr.F1 && maxDat < fr.F1.p1) fric += fr.F1.penalty;
+    if (fr.F2 && spec >= fr.F2.p2) fric += fr.F2.penalty;
+    if (fr.F3 && exec / n < fr.F3.p1) fric += fr.F3.penalty;
+    if (fr.F4 && hammer > fr.F4.p1 * ctx.budget && com / n < fr.F4.p2) fric += fr.F4.penalty;
+    if (fr.F5 && !(fnMask & ctx.customerMask)) fric += fr.F5.penalty;
     if (fr.F6 && juniors >= fr.F6.p2 && maxLead < fr.F6.p3) fric += fr.F6.penalty;
     var pd = Math.max(0, Math.min(100, 50 + 100 * S.priceDisciplineSlope * (1 - hammer / bench)));
     var finals = [], sumF = 0, sumPen = 0;
@@ -738,7 +770,9 @@
 
   /** opts.challenge = 'C1'|'C2'|'C3' plays a single problem (one twist); omit for the three-round game. */
   function createGame(data, seed, opts) {
-    var S = data.settings, rng = RNG.make(seed), challenge = opts && opts.challenge || null;
+    var challenge = opts && opts.challenge || null;
+    if (challenge && engine.view) data = engine.view(data, challenge);   // that problem's stars and lots
+    var S = data.settings, rng = RNG.make(seed);
     var mode = MODES[opts && opts.mode] || MODES.hva;
     var personas = mode.id === 'ava' ? { human: (opts && opts.personas && opts.personas.human) || 'analyst', ai: (opts && opts.personas && opts.personas.ai) || 'maverick' }
       : { human: null, ai: mode.controllers.ai === 'ai' ? 'standard' : null };
@@ -1187,6 +1221,7 @@
   function fill(tpl, vars) { return tpl.replace(/\{(\w+)\}/g, function (m, k) { return vars[k] !== undefined ? vars[k] : m; }); }
 
   function build(data, game, sc) {
+    data = (game && game.data) || data;   // the problem's view (per-problem stars and lots)
     var H = sc.human, A = sc.ai, I = engine.index(data);
     var mode = game.mode || 'hva', W = game.names || { human: 'You', ai: 'AI Manager' };
     var nm = { human: W.human, ai: mode === 'hva' ? 'AI' : W.ai };   // short names inside sentences
@@ -1362,10 +1397,11 @@
   if (isNode) module.exports = mod; else { root.TA = root.TA || {}; root.TA.report = mod; }
 })(typeof self !== 'undefined' ? self : this, function (engine) {
   'use strict';
-  var FN_SHORT = { 'Brand & Marketing': 'Brand', 'Customer Development': 'Cust Dev', 'Consumer Insights & Analytics': 'Insights',
-    'R&D & Product Innovation': 'R&D', 'Supply Chain & Operations': 'Supply', 'Finance & Commercial': 'Finance' };
+  var FN_SHORT = { 'Commercial & Category': 'Commercial', 'Operations & Supply Chain': 'Operations', 'People & Service': 'People',
+    'Quality & Compliance': 'Quality', 'Analytics, Finance & Expansion': 'Analytics', 'Product & Market Strategy': 'Product',
+    'Manufacturing & Plant': 'Plant', 'EV & Engineering': 'EV & Eng.' };
   function fs(f) { return FN_SHORT[f] || String(f).split(' ')[0]; }
-  var ADAPT = 'Adaptability', RES = 'Resilience';
+  var ADAPT = 'Adaptability';
   function f1(x) { return (Math.round(x * 10) / 10).toFixed(1); }
   function f2(x) { return (Math.round(x * 100) / 100).toFixed(2); }
   function money(x) { return '₹' + (Math.round(x * 10) / 10) + 'L'; }
@@ -1388,6 +1424,7 @@
   ];
 
   function build(data, game, sc) {
+    data = (game && game.data) || data;   // the problem's view (per-problem stars and lots)
     var S = data.settings, I = engine.index(data);
     var names = game.names || { human: 'You', ai: 'AI Manager' };
     var tie = Math.abs(sc.human.final - sc.ai.final) < 1e-9;
@@ -1455,7 +1492,7 @@
         return { id: c.id, name: c.name, function: c.function, fit: fit, rel: rel, core: rel >= S.relevanceIn, impact: fit * rel,
           price: x.m.price, benchmark: c.benchmark, ratio: ratio, verdict: ratio <= 0.85 ? 'Bargain' : ratio > 1.0001 ? 'Overpaid' : 'Fair',
           forced: !!x.m.forced, isStar: !!c.isStar, roles: roles, mvp: false, weakest: false,
-          adaptRes: (c.attrs[ADAPT] + c.attrs[RES]) / 2 };
+          adaptRes: c.attrs[ADAPT] };
       });
       var byImpact = rows.slice().sort(function (a, b) { return b.impact - a.impact; });
       if (byImpact.length) { byImpact[0].mvp = true; byImpact[byImpact.length - 1].weakest = true; }
@@ -1548,7 +1585,7 @@
         missed = 'Paid ' + pct(bb.ratio) + ' of benchmark (discipline ' + f1(bb.discipline) + ', value per rupee ' + f1(bb.value) + ')' + (bb.overpaid.length ? '; overpaid for ' + list(bb.overpaid.map(function (x) { return first(x.name) + ' ' + money(x.price) + ' vs ' + money(x.benchmark); }), 3) : '');
       } else if (key === 'risk') {
         var sA = squads[A].slice().sort(function (x, y) { return y.adaptRes - x.adaptRes; })[0], sB = squads[B].slice().sort(function (x, y) { return x.adaptRes - y.adaptRes; })[0];
-        had = 'Adaptability + Resilience averaged ' + f1(risk[A]) + '; ' + sA.name + ' led at ' + f1(sA.adaptRes * 10);
+        had = 'Adaptability averaged ' + f1(risk[A]) + '; ' + sA.name + ' led at ' + f1(sA.adaptRes * 10);
         missed = 'Averaged ' + f1(risk[B]) + '; ' + sB.name + ' was lowest at ' + f1(sB.adaptRes * 10);
       } else if (key === 'captain') {
         var cDesc = function (s) { var c = sc[s].captain; if (!c) return 'No captain named';
@@ -1622,8 +1659,9 @@
   if (isNode) module.exports = mod; else { root.TA = root.TA || {}; root.TA.transfer = mod; }
 })(typeof self !== 'undefined' ? self : this, function (engine) {
   'use strict';
-  var FN_SHORT = { 'Brand & Marketing': 'Brand', 'Customer Development': 'Cust Dev', 'Consumer Insights & Analytics': 'Insights',
-    'R&D & Product Innovation': 'R&D', 'Supply Chain & Operations': 'Supply', 'Finance & Commercial': 'Finance' };
+  var FN_SHORT = { 'Commercial & Category': 'Commercial', 'Operations & Supply Chain': 'Operations', 'People & Service': 'People',
+    'Quality & Compliance': 'Quality', 'Analytics, Finance & Expansion': 'Analytics', 'Product & Market Strategy': 'Product',
+    'Manufacturing & Plant': 'Plant', 'EV & Engineering': 'EV & Eng.' };
   function fs(f) { return FN_SHORT[f] || String(f).split(' ')[0]; }
   var CONFIG = {
     aiMinGain: 0.25,        // the AI only signs when it gains at least this many final-score points
@@ -1634,14 +1672,17 @@
   function refund(m) { return Math.round(m.price * CONFIG.refundShare * 10) / 10; }
 
   function score(data, game, squad, side) {
+    data = (game && game.data) || data;   // the problem's view (per-problem stars and lots)
     return engine.scoreTeam(data, squad.map(function (m) { return m.id; }), squad.map(function (m) { return m.price; }), game.twists,
       game.challenge ? { rounds: [game.challenge], captain: game.captain ? game.captain[side] : null } : null);
   }
   /** Candidates nobody owns: unsold regulars and offered stars that went unsold (not the star withdrawn before the auction). */
   function pool(data, game) {
+    data = (game && game.data) || data;   // the problem's view (per-problem stars and lots)
     return data.candidates.filter(function (c) {
       if (game.sold[c.id]) return false;
       if (c.isStar && (game.offeredStars || []).indexOf(c.id) < 0) return false;
+      if (c.inAuction === false) return false;   // not in this problem's auction
       return true;
     }).map(function (c) { return c.id; });
   }
@@ -1684,6 +1725,7 @@
 
   /** Every legal, affordable one-for-one swap for `side`, best first. */
   function options(data, game, side) {
+    data = (game && game.data) || data;   // the problem's view (per-problem stars and lots)
     var I = engine.index(data), t = game.teams[side], before = score(data, game, t.squad, side), list = [];
     pool(data, game).forEach(function (inId) {
       var inC = I.byId[inId], price = fee(inC);
@@ -1704,6 +1746,7 @@
 
   /** Make the swap. Returns the log entry. */
   function apply(data, game, swap) {
+    data = (game && game.data) || data;   // the problem's view (per-problem stars and lots)
     var I = engine.index(data), t = game.teams[swap.side], i = -1;
     t.squad.forEach(function (m, k) { if (m.id === swap.out) i = k; });
     if (i < 0) throw new Error('not in squad: ' + swap.out);
@@ -1727,6 +1770,7 @@
 
   /** The AI's choice: its best swap if it gains enough, else null. */
   function aiPick(data, game, side) {
+    data = (game && game.data) || data;   // the problem's view (per-problem stars and lots)
     var best = options(data, game, side).swaps[0];
     return best && best.gain >= CONFIG.aiMinGain ? best : null;
   }
@@ -1754,7 +1798,7 @@
     betterFit: 8,      // a same-function candidate at least this many fit points better counts as a missed option
     dragShown: 0.3     // skill drag below this is not listed as a reason
   };
-  var ATTR_EXEC = 'Execution', ATTR_COMMAC = 'Commercial Acumen';
+  var ATTR_EXEC = 'Execution', ATTR_COMMAC = 'Commercial';
   function r1(x) { return Math.round(x * 10) / 10; }
   function first(n) { return String(n).split(' ')[0]; }
   function list(a, conj) { conj = conj || 'and'; return a.length < 2 ? a.join('') : a.slice(0, -1).join(', ') + ' ' + conj + ' ' + a[a.length - 1]; }
@@ -1767,6 +1811,7 @@
   }
   /** Everyone who went under the hammer this game: regulars plus the stars that were offered. */
   function auctionPool(data, game) {
+    data = (game && game.data) || data;   // the problem's view (per-problem stars and lots)
     return data.candidates.filter(function (c) { return !c.isStar || (game.offeredStars || []).indexOf(c.id) >= 0; });
   }
 
@@ -1775,6 +1820,7 @@
    * opts.squad: the squad to analyse (default: the side's current squad); opts.sc: its scoreTeam result for the game's round.
    */
   function analyse(data, game, side, opts) {
+    data = (game && game.data) || data;   // the problem's view (per-problem stars and lots)
     opts = opts || {};
     var S = data.settings, I = engine.index(data), roundId = game.challenge;
     var squad = opts.squad || game.teams[side].squad;
@@ -1792,7 +1838,7 @@
     var fr = sc.friction.rules.filter(function (f) { return f.penalty !== 0; }).map(function (f) {
       var who = f.members && f.members.length ? f.members.slice() : [];
       var rule = data.friction.filter(function (r) { return r.id === f.id; })[0] || {};
-      if (!who.length && f.id === 'F3') who = members.filter(function (x) { return x.c.attrs[ATTR_EXEC] < rule.p2; }).map(function (x) { return x.c.id; });
+      if (!who.length && f.id === 'F3') who = members.filter(function (x) { return x.c.attrs[ATTR_EXEC] < rule.p1; }).map(function (x) { return x.c.id; });
       if (!who.length && f.id === 'F4') who = members.filter(function (x) { return x.c.attrs[ATTR_COMMAC] < rule.p2; }).map(function (x) { return x.c.id; });
       // a rule nobody in particular owns (e.g. no customer-facing hire) is reported as a team gap, not pinned on one person
       return { id: f.id, name: f.name, why: f.why, penalty: f.penalty, who: who, share: who.length ? f.penalty / who.length : 0, teamWide: !who.length };
@@ -1805,7 +1851,7 @@
       var twistLost = ex && ex.exposed && !ex.covered ? ex.penalty * wC : 0;
       if (twistLost > 0) {
         reasons.push({ kind: 'twist', icon: 'bolt', cls: 'bad', lost: twistLost,
-          text: 'Hit by ' + tw.name + ': ' + c.riskCode + ' risk, severity ' + c.riskSeverity + '. Known weakness: ' + c.riskText.replace(/\.$/, '') + '.' });
+          text: 'Hit by ' + tw.name + ': ' + c.riskCode + ' area, severity ' + c.riskSeverity + '. ' + c.riskText.replace(/\.$/, '') + '.' });
         reasons.push({ kind: 'nocover', icon: 'shield', cls: 'warn', lost: 0,
           text: 'Nobody could cover: the twist needed ' + compName[tw.cover] + ' ' + tw.threshold + '+, and the best teammate' + (ex.coverByName ? ' (' + first(ex.coverByName) + ')' : '') + ' had ' + r1(ex.coverValue).toFixed(1) + '.' });
       } else if (ex && ex.covered) plus.push({ icon: 'shield', text: 'Exposed to the twist, but ' + first(ex.coverByName) + ' covered them.' });
@@ -2169,54 +2215,67 @@
   function root_verify() { return (typeof module === 'object' && module.exports) ? require('./verify.js') : (typeof self !== 'undefined' ? self : this).TA.verify; }
   function root_ai() { return (typeof self !== 'undefined' ? self : this).TA.ai; }
   var TOL = 0.0005;
-  var SCORING = [
-    { name: 'A', ids: ['X01', 'S04', 'D03', 'O04', 'F03'], prices: [100, 12, 14, 13, 15], twists: ['T1A', 'T2A', 'T3A'],
-      expect: { final: 86.094, challenge: 85.048, synergy: 100, budget: 82.599, risk: 83, friction: 0 } },
-    { name: 'B', ids: ['S01', 'D02', 'R04', 'O02', 'F02'], prices: [40, 35, 22, 28, 29], twists: ['T1B', 'T2B', 'T3B'],
-      expect: { final: 84.046, challenge: 85.636, budget: 57.007, friction: 0 } },
-    { name: 'C', ids: ['M01', 'S01', 'R01', 'D01', 'F01'], prices: [30, 35, 38, 36, 30], twists: ['T1C', 'T2C', 'T3C'],
-      expect: { final: 74.992, challenge: 80.187, budget: 61.616, friction: -5 }, frictionIds: ['F1', 'F2'] },
-    { name: 'D', ids: ['X02', 'D01', 'R01', 'F05', 'S05'], prices: [95, 35, 38, 18, 12], twists: ['T1A', 'T2C', 'T3C'],
-      expect: { final: 75.869, challenge: 76.551, budget: 60.830, friction: -2 }, frictionIds: ['F2', 'F4'] }
-  ];
+  var SCORING = [];
+  /** Reference teams: written into the data by scripts/build_data_v4.py, which scores them with its own (Python)
+   *  implementation of the rules. The JS engine must reproduce every component to 3 decimals. */
+  function refTeams(data) {
+    if (!data.evaluator) return SCORING;
+    SCORING = data.evaluator.map(function (t) {
+      var e = t.expected;
+      return { name: t.name, ids: t.ids, prices: t.prices, twists: t.twists, rounds: t.rounds, view: t.view,
+        expect: { final: e.final, challenge: e.challenge, synergy: e.synergy, budget: e.budgetEfficiency, risk: e.risk, friction: e.friction } };
+    });
+    return SCORING;
+  }
   var KEYS = { final: function (r) { return r.final; }, challenge: function (r) { return r.challenge; },
     synergy: function (r) { return r.synergy.score; }, budget: function (r) { return r.budget.efficiency; },
     risk: function (r) { return r.risk; }, friction: function (r) { return r.friction.total; } };
 
   function scoringTests(data) {
-    return SCORING.map(function (t) {
-      var r = engine.scoreTeam(data, t.ids, t.prices, t.twists), checks = [];
+    return refTeams(data).map(function (t) {
+      var d = t.view && engine.view ? engine.view(data, t.view) : data;
+      var r = engine.scoreTeam(d, t.ids, t.prices, t.twists, t.rounds ? { rounds: t.rounds } : null), checks = [];
       Object.keys(t.expect).forEach(function (k) {
         var got = KEYS[k](r), exp = t.expect[k];
-        // expected values are given to 3 decimals: pass if they agree when rounded to 3 decimals
-        checks.push({ key: k, expected: exp, got: got, pass: Math.abs(Math.round(got * 1000) / 1000 - exp) < TOL });
+        checks.push({ key: k, expected: exp, got: got, pass: Math.abs(got - exp) < TOL });
       });
       if (t.frictionIds) {
         var trig = r.friction.rules.filter(function (f) { return f.triggered; }).map(function (f) { return f.id; }).sort().join(',');
         checks.push({ key: 'friction rules', expected: t.frictionIds.join(','), got: trig, pass: trig === t.frictionIds.join(',') });
       }
-      return { name: 'Team ' + t.name + ': ' + t.ids.join(' ') + ' @ ' + t.prices.join('/') + ' · ' + t.twists.join(' '),
+      var tw = Array.isArray(t.twists) ? t.twists.join(' ') : Object.keys(t.twists).map(function (k) { return t.twists[k]; }).join(' ');
+      return { name: 'Team ' + t.name + ': ' + t.ids.join(' ') + ' @ ' + t.prices.join('/') + ' · ' + tw + (t.view ? ' · ' + t.view + ' with its star' : ''),
         pass: checks.every(function (c) { return c.pass; }), checks: checks, final: r.final };
     });
   }
 
   function auctionTests(data, n) {
-    var out = [], S = data.settings;
-    // unit checks on rules
-    var g = A.createGame(data, 'UNIT-1');
+    var out = [], S = data.settings; refTeams(data);
+    // unit checks on rules (a Zepto profitable-growth game: its own stars and lots)
+    var g = A.createGame(data, 'UNIT-1', { challenge: 'C1' }), GS = g.data.settings, rdC1 = data.rounds.filter(function (r) { return r.id === 'C1'; })[0];
     out.push({ name: 'Increments: +1 below 40, +2 from 40, +5 from 80',
       pass: A.increment(g, 39) === 1 && A.increment(g, 40) === 2 && A.increment(g, 79) === 2 && A.increment(g, 80) === 5 && A.increment(g, 120) === 5 });
-    out.push({ name: 'First ' + S.starsOffered + ' lots are marquee stars; the 4th star is withdrawn',
-      pass: g.queue.slice(0, S.starsOffered).every(function (q) { return q.kind === 'star'; }) && g.queue.filter(function (q) { return q.kind === 'star'; }).length === S.starsOffered });
-    var setsOk = true; for (var i = S.starsOffered; i < g.queue.length - 1; i++) { if (g.queue[i].set > g.queue[i + 1].set) setsOk = false; }
-    out.push({ name: 'Core sets 1→5 in order (shuffled within each set)', pass: setsOk && g.queue.length === S.starsOffered + 30 });
+    var starIds = g.queue.filter(function (q) { return q.kind === 'star'; }).map(function (q) { return q.id; }).sort().join();
+    out.push({ name: 'Stars are per problem: this problem’s stars open the auction as marquee lots (' + starIds + ')',
+      pass: g.queue.slice(0, GS.starsOffered).every(function (q) { return q.kind === 'star'; }) && starIds === (rdC1.stars || []).slice().sort().join() &&
+        data.rounds.every(function (rd) { var v = engine.view(data, rd.id); return v.candidates.filter(function (c) { return c.isStar; }).map(function (c) { return c.id; }).sort().join() === (rd.stars || []).slice().sort().join(); }) });
+    var setsOk = true; for (var i = GS.starsOffered; i < g.queue.length - 1; i++) { if (g.queue[i].set > g.queue[i + 1].set) setsOk = false; }
+    var qIds = g.queue.map(function (q) { return q.id; }).sort().join(), lotIds = (rdC1.lots || []).map(function (l) { return l.id; }).sort().join();
+    var quotaOk = data.rounds.every(function (rd) { var v = engine.view(data, rd.id), off = v.candidates.filter(function (c) { return c.inAuction && !c.isStar; });
+      return (rd.highRelevance || []).every(function (f) { var all = data.candidates.filter(function (c) { return c.function === f && (c.starIn || []).indexOf(rd.id) < 0; }).length;
+        return off.filter(function (c) { return c.function === f; }).length >= Math.min(S.coreQuota || 5, all); }); });
+    out.push({ name: 'Each auction offers up to ' + (S.lotsPerGame || 33) + ' mixed lots: the stars, every core role’s best fits, a capped number of strong fits, affordable fillers, tempting weak fits and solid ones, in sets 1→5',
+      pass: setsOk && g.queue.length === (rdC1.lots || []).length && g.queue.length <= (S.lotsPerGame || 33) && qIds === lotIds && quotaOk });
+    var premOk = data.rounds.every(function (rd) { var v = engine.view(data, rd.id);
+      return v.candidates.filter(function (c) { return c.isStar; }).every(function (c) { var sh = c.benchmark / rd.budget; return sh >= 0.5 && sh <= 0.65 && c.benchmark >= c.basePrice; }); });
+    out.push({ name: 'Star premium: in its problem every star asks 50–65% of the budget (never below its market value)', pass: premOk });
     // leader cannot re-bid; pass is final
     var g2 = A.createGame(data, 'UNIT-2');
     A.bid(g2, 'human'); var again = A.canBid(g2, 'human');
     A.pass(g2, 'ai');
     out.push({ name: 'Leader cannot raise own bid; first to stop ends the lot', pass: again.ok === false && again.code === 'leader' && g2.lastResult && g2.lastResult.winner === 'human' && g2.lastResult.price === g2.lastResult.startingBid });
     // reserve rule
-    var g3 = A.createGame(data, 'UNIT-3'); g3.teams.human.purse = 50;
+    var g3 = A.createGame(data, 'UNIT-3', { challenge: 'C1' }); g3.teams.human.purse = 50;
     var cb = A.canBid(g3, 'human');
     out.push({ name: 'Squad-completion reserve blocks a star bid with ₹50L left', pass: cb.ok === false && cb.code === 'reserve' });
     // simulations
@@ -2228,8 +2287,8 @@
     out.push({ name: 'Game length with an active human (the planning AI waits for its best fits, so it can run past the human\u2019s fifth hire)', pass: lots >= 10 && lots <= 30, detail: 'avg ' + lots.toFixed(1) + ' lots reached' });
     // single-problem mode: challenge = that round's score; AI base walk reproduces the workbook formula
     var r3 = engine.scoreTeam(data, SCORING[0].ids, SCORING[0].prices, SCORING[0].twists);
-    var r1 = engine.scoreTeam(data, SCORING[0].ids, SCORING[0].prices, { C2: 'T2A' }, { rounds: ['C2'] });
-    out.push({ name: 'Single-problem mode scores only the chosen round (Team A, Supply Chain Crisis)',
+    var r1 = engine.scoreTeam(data, SCORING[0].ids, SCORING[0].prices, { C2: SCORING[0].twists[1] }, { rounds: ['C2'] });
+    out.push({ name: 'Single-problem mode scores only the chosen round (Team A, Zepto food safety)',
       pass: r1.rounds.length === 1 && Math.abs(r1.challenge - r3.rounds[1].score) < 1e-9, detail: 'round score ' + r1.challenge.toFixed(3) });
     var AI = (typeof module === 'object' && module.exports) ? require('./ai.js') : root_ai();
     var gw = A.createGame(data, 'UNIT-W', { challenge: 'C1' }), gw3 = A.createGame(data, 'UNIT-W3');
@@ -2244,8 +2303,9 @@
       if (engine.scoreTeam(data, SCORING[0].ids, SCORING[0].prices, (function () { var o = {}; o[rd.id] = gb.twists[rd.id]; return o; })(), { rounds: [rd.id] }).budget.total !== rd.budget) coBad.push(rd.id + ' scoring budget');
       if (Object.keys(gb.twists).join() !== rd.id) coBad.push(rd.id + ' twist');
     });
-    var minStar = Math.min.apply(null, data.candidates.filter(function (c) { return c.isStar; }).map(function (c) { return c.startingBid; }));
-    var tight = data.rounds.filter(function (rd) { return minStar + (S.seats - 1) * S.reserveFloor > rd.budget; }).map(function (rd) { return rd.id; });
+    var tight = data.rounds.filter(function (rd) {
+      var v = engine.view(data, rd.id), st = v.candidates.filter(function (c) { return c.isStar; }).map(function (c) { return c.startingBid; });
+      return !st.length || Math.min.apply(null, st) + (S.seats - 1) * S.reserveFloor > rd.budget; }).map(function (rd) { return rd.id; });
     out.push({ name: 'Companies: 3 companies × 3 problems; each problem sets both purses and the scoring to its own budget',
       pass: coOk && !coBad.length && !!engine.budgetOf && engine.budgetOf(data, null) === S.budget,
       detail: coBad.length ? coBad.join(', ') : 'budgets ' + data.rounds.map(function (rd) { return rd.id + ' ₹' + rd.budget + 'L'; }).join(' · ') + (tight.length ? ' · no star affordable in ' + tight.join(', ') : '') });
@@ -2281,6 +2341,7 @@
       var ctx = BR.context(data, rd.id, rd.budget || S.budget);
       for (var k = 0; k < 40; k++) {
         var ids = [], used = {}, step = 7 + (k % 5) * 2, at = (k * 13 + rd.id.length) % ncand;
+        var gcd = function (a, b) { return b ? gcd(b, a % b) : a; }; while (gcd(step, ncand) !== 1) step++;   // a step sharing a factor with the pool size would cycle
         while (ids.length < S.seats) { var cc = data.candidates[at % ncand]; if (!used[cc.id]) { used[cc.id] = 1; ids.push(cc.id); } at += step; }
         var prices = ids.map(function (id, i) { return 10 + ((k * 7 + i * 11) % 60); });
         var q = BR.quick(ctx, ids.map(function (id, i) { return { x: ctx.byId[id], price: prices[i] }; }));
