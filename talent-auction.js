@@ -359,7 +359,10 @@
   var STYLE = {
     standard: { pay: 1.0, risk: 1.0, star: 0, compete: 1.0 },
     analyst: { pay: 1.0, risk: 1.4, star: 0, compete: 0.95 },
-    maverick: { pay: 1.0, risk: 0.85, star: 1.2, compete: 1.05 }
+    maverick: { pay: 1.0, risk: 0.85, star: 1.2, compete: 1.05 },
+    // company hiring styles for the AI Manager (Human vs AI): senior / junior = score bonus per member with 12+ / 4- years
+    scrappy: { pay: 0.92, risk: 1.0, star: 0, compete: 0.95, senior: -0.6, junior: 0.4 },
+    proven: { pay: 1.05, risk: 1.1, star: 0.4, compete: 1.0, senior: 0.8, junior: -0.5 }
   };
 
   /* ---------------- a fast, exact copy of the scoring for one problem ---------------- */
@@ -442,9 +445,10 @@
       finals.push(f); sumF += f; sumPen += pen;
     }
     var T = ctx.twists.length || 1, mean = sumF / T, penMean = sumPen / T;
-    var st = style || STYLE.standard;
+    var st = style || STYLE.standard, taste = 0;
+    if (st.senior || st.junior) for (i = 0; i < n; i++) { var ex = team[i].x.exp; if (ex >= 12) taste += st.senior || 0; else if (ex <= 4) taste += st.junior || 0; }
     return { mean: mean, finals: finals, penalty: penMean,
-      value: mean - (st.risk - 1) * S.wChallenge * penMean + st.star * activeStars };
+      value: mean - (st.risk - 1) * S.wChallenge * penMean + st.star * activeStars + taste };
   }
 
   /* ---------------- planning ---------------- */
@@ -503,6 +507,28 @@
     return out;
   }
 
+  /** The strongest squad that could have been built from this game's lots within the budget. Each candidate costs what
+   *  they actually sold for in this auction (or their opening bid if nobody bought them). Planned without knowing which shock
+   *  would hit (mean over the problem's shocks), like the AI plans. Both real squads are candidates too, so it is never worse. */
+  function bestTeam(game, opts) {
+    var data = game.data, S = data.settings, budget = game.budget || engine.budgetOf(data, game.challenge ? { rounds: [game.challenge] } : null);
+    var ctx = context(data, game.challenge, budget), seen = {}, pool = [], paid = {};
+    (game.log || []).forEach(function (e) { if (e.winner && e.price != null) paid[e.id] = e.price; });
+    game.queue.forEach(function (q) { if (seen[q.id]) return; seen[q.id] = 1; var x = ctx.byId[q.id]; if (x) pool.push({ x: x, exp: paid[q.id] != null ? paid[q.id] : x.start }); });
+    pool.sort(function (a, b) { return b.x.fit - a.x.fit || (a.x.id < b.x.id ? -1 : 1); });
+    var r = plan(ctx, [], pool, S.seats, budget, STYLE.standard, { beam: (opts && opts.beam) || 60 });
+    var best = { team: r.team, v: r.value };
+    ['human', 'ai'].forEach(function (sd) {
+      var mine = (game.log || []).filter(function (e) { return e.winner === sd && e.price != null; });
+      if (mine.length !== S.seats) return;
+      var team = mine.map(function (e) { return { x: ctx.byId[e.id], price: e.price }; });
+      if (team.some(function (m) { return !m.x; })) return;
+      var v = quick(ctx, team, STYLE.standard).value; if (v > best.v + 1e-9) best = { team: team, v: v, from: sd };
+    });
+    return { ids: best.team.map(function (m) { return m.x.id; }), prices: best.team.map(function (m) { return m.price; }),
+      cost: best.team.reduce(function (a, m) { return a + m.price; }, 0), from: best.from || null };
+  }
+
   var walkCache = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
   /**
    * The most this side should pay for candidate `id` right now, from its plans.
@@ -556,7 +582,7 @@
     return res;
   }
 
-  return { CONFIG: CONFIG, STYLE: STYLE, context: context, quick: quick, plan: plan, futurePool: futurePool, think: think };
+  return { bestTeam: bestTeam, CONFIG: CONFIG, STYLE: STYLE, context: context, quick: quick, plan: plan, futurePool: futurePool, think: think };
 });
 
 /* ---- src/ai.js ---- */
@@ -590,8 +616,20 @@
     analyst: { id: 'analyst', name: 'The Analyst', walkMult: 0.98, starMult: 0.9, repeatMult: 0.9, pushLots: 0,
       blurb: 'Careful planner. Weighs twist insurance 40% more and expects bargains later in the auction.' },
     maverick: { id: 'maverick', name: 'The Maverick', walkMult: 1, starMult: 1.2, repeatMult: 1, pushLots: 2,
-      blurb: 'Star chaser. Gives an active star extra value and takes more twist risk to land one.' }
+      blurb: 'Star chaser. Gives an active star extra value and takes more twist risk to land one.' },
+    /* the AI Manager's hiring style follows the company (Human vs AI and the AI seat online) */
+    scrappy: { id: 'scrappy', name: 'AI Manager', style: 'Scrappy value hunter', walkMult: 0.95, starMult: 0.9, repeatMult: 0.95, pushLots: 1,
+      blurb: 'Startup style: hunts bargains, likes hungry juniors, rarely pays up for big names.' },
+    proven: { id: 'proven', name: 'AI Manager', style: 'Pays for proven seniors', walkMult: 1.03, starMult: 1.05, repeatMult: 1, pushLots: 2,
+      blurb: 'Big-company style: pays for experience and track record, wary of untested juniors.' }
   };
+  PERSONAS.standard.style = 'Balanced planner';
+  /** The AI Manager's style for a problem: startup = scrappy, mature company = proven, growing = standard. */
+  function companyStyle(data, roundId) {
+    var co = (data.companies || []).filter(function (c) { return (c.rounds || []).indexOf(roundId) >= 0; })[0];
+    var st = co && String(co.stage || '').toLowerCase();
+    return !st ? 'standard' : st.indexOf('startup') >= 0 ? 'scrappy' : st.indexOf('mature') >= 0 ? 'proven' : 'standard';
+  }
   function persona(game, side) {
     var p = game.personas && game.personas[side];
     return PERSONAS[p] || PERSONAS.standard;
@@ -713,7 +751,7 @@
 
   /** Captain pick: the hire with the best expected captain points over every twist this problem could draw (the AI
    *  never sees the real one). The Analyst weighs a possible doubled twist penalty 40% more; the Maverick backs its star. */
-  var CAPTAIN_STYLE = { standard: { risk: 1, star: 0 }, analyst: { risk: 1.4, star: 0 }, maverick: { risk: 0.85, star: 0.6 } };
+  var CAPTAIN_STYLE = { standard: { risk: 1, star: 0 }, analyst: { risk: 1.4, star: 0 }, maverick: { risk: 0.85, star: 0.6 }, scrappy: { risk: 1, star: 0 }, proven: { risk: 1.1, star: 0.3 } };
   function captainValues(game, side, styleName) {
     var data = game.data, ch = game.challenge, t = game.teams[side];
     if (!ch || !t.squad.length) return [];
@@ -740,7 +778,7 @@
     return game.aiRng.float(CONFIG.delayMin, Math.max(CONFIG.delayMin, hi));
   }
 
-  return { pickCaptain: pickCaptain, captainValues: captainValues, CONFIG: CONFIG, PERSONAS: PERSONAS, persona: persona, baseWalk: baseWalk, walkAway: walkAway, classicWalk: classicWalk, decide: decide, delay: delay, isWanted: isWanted, humanTight: humanTight };
+  return { companyStyle: companyStyle, pickCaptain: pickCaptain, captainValues: captainValues, CONFIG: CONFIG, PERSONAS: PERSONAS, persona: persona, baseWalk: baseWalk, walkAway: walkAway, classicWalk: classicWalk, decide: decide, delay: delay, isWanted: isWanted, humanTight: humanTight };
 });
 
 /* ---- src/auction.js ---- */
@@ -775,7 +813,7 @@
     var S = data.settings, rng = RNG.make(seed);
     var mode = MODES[opts && opts.mode] || MODES.hva;
     var personas = mode.id === 'ava' ? { human: (opts && opts.personas && opts.personas.human) || 'analyst', ai: (opts && opts.personas && opts.personas.ai) || 'maverick' }
-      : { human: null, ai: mode.controllers.ai === 'ai' ? 'standard' : null };
+      : { human: null, ai: mode.controllers.ai === 'ai' ? (opts && opts.personas && opts.personas.ai) || (challenge ? AI.companyStyle(data, challenge) : 'standard') : null };
     var names = mode.id === 'hvh' ? { human: (opts && opts.names && opts.names.human) || 'Player 1', ai: (opts && opts.names && opts.names.ai) || 'Player 2' }
       : mode.id === 'ava' ? { human: AI.PERSONAS[personas.human].name, ai: AI.PERSONAS[personas.ai].name } : { human: 'You', ai: 'AI Manager' };
     var stars = rng.shuffle(data.candidates.filter(function (c) { return c.isStar; })).slice(0, S.starsOffered);
@@ -873,21 +911,19 @@
     event(game, null, (q.phase === 'lastcall' ? 'Last call: ' : 'Lot ' + game.lotsReached + ': ') + c.name + ' (' + c.function + ') opens at ₹' + c.startingBid + 'L', 'lot');
   }
 
-  /** Move to the next lot that at least one team can bid on. Handles last call, forced fill and the end. */
+  /** Move to the next lot that at least one team can bid on. Handles the comeback round, forced fill and the end. */
   function advance(game) {
     if (game.actions) game.actions.push({ k: 'a' });
-    game.lot = null;
+    step(game);
+  }
+  function step(game) {
+    game.lot = null; game.skippedNow = [];
     while (true) {
       if (openSeats(game, 'human') === 0 && openSeats(game, 'ai') === 0) { finish(game); return; }
+      if (game.phase === 'comeback') return;            // waiting for the comeback picks
       game.pos++;
       if (game.pos >= game.queue.length) {
-        if (!game.lastCallBuilt) {
-          game.lastCallBuilt = true; game.phase = 'lastcall';
-          var again = game.unsold.filter(function (id) { return !game.sold[id] && !C(game, id).isStar; });
-          again.forEach(function (id) { game.queue.push({ id: id, kind: 'regular', phase: 'lastcall', set: 'Last call' }); });
-          if (again.length) { event(game, null, 'Last call: ' + again.length + ' unsold candidate(s) re-offered at their starting bid', 'phase'); }
-          continue;
-        }
+        if (!game.lastCallBuilt) { if (startComeback(game)) return; continue; }
         forceFill(game); finish(game); return;
       }
       var q = game.queue[game.pos];
@@ -896,11 +932,57 @@
       if (!anyone) {
         if (q.kind === 'star') game.withdrawnStars.push(q.id);
         else if (q.phase === 'main' && game.unsold.indexOf(q.id) < 0) game.unsold.push(q.id);
+        game.skippedNow.push(q.id);
         continue;
       }
       startLot(game, q);
       return;
     }
+  }
+
+  /* ---------- comeback round: each side brings back up to 3 unsold candidates (replaces the automatic last call) ---------- */
+  function comebackMax(game) { return game.data.settings.comebackPicks || 3; }
+  function comebackOptions(game) {
+    return game.unsold.filter(function (id) { return !game.sold[id] && !C(game, id).isStar; });
+  }
+  /** The AI's picks: the unsold candidates it values most above their opening bid (it can still bid on them). */
+  function aiComebackPicks(game, side) {
+    var opts = comebackOptions(game).filter(function (id) { return eligible(game, side, id).ok; });
+    var scored = opts.map(function (id) { var w = AI.walkAway(game, id, side); return { id: id, gain: (w && w.final || 0) - C(game, id).startingBid }; })
+      .filter(function (x) { return x.gain >= 0; }).sort(function (a, b) { return b.gain - a.gain || (a.id < b.id ? -1 : 1); });
+    return scored.slice(0, comebackMax(game)).map(function (x) { return x.id; });
+  }
+  /** Start the comeback round. Returns true when it waits for a person's picks. */
+  function startComeback(game) {
+    var opts = comebackOptions(game);
+    var need = { human: openSeats(game, 'human') > 0 && opts.length > 0, ai: openSeats(game, 'ai') > 0 && opts.length > 0 };
+    if (!need.human && !need.ai) { game.lastCallBuilt = true; return false; }
+    game.phase = 'comeback';
+    game.comeback = { options: opts, picks: { human: need.human ? null : [], ai: need.ai ? null : [] }, max: comebackMax(game) };
+    SIDES.forEach(function (sd) { if (game.comeback.picks[sd] === null && game.controllers[sd] === 'ai') game.comeback.picks[sd] = aiComebackPicks(game, sd); });
+    event(game, null, 'Comeback round: each side may bring back up to ' + comebackMax(game) + ' unsold candidates', 'phase');
+    if (game.comeback.picks.human !== null && game.comeback.picks.ai !== null) { buildComeback(game); return false; }
+    return true;
+  }
+  function buildComeback(game) {
+    var P = game.comeback.picks, order = [], seen = {}, n = Math.max(P.human.length, P.ai.length);
+    for (var i = 0; i < n; i++) [P.human[i], P.ai[i]].forEach(function (id) { if (id && !seen[id]) { seen[id] = 1; order.push(id); } });
+    order.forEach(function (id) { game.queue.push({ id: id, kind: 'regular', phase: 'lastcall', set: 'Comeback round', by: (P.human.indexOf(id) >= 0 ? 'h' : '') + (P.ai.indexOf(id) >= 0 ? 'a' : '') }); });
+    game.lastCallBuilt = true; game.phase = 'lastcall'; game.comeback.order = order;
+    event(game, null, order.length ? 'Comeback round: ' + order.length + ' candidate(s) back on the block at their opening bid' : 'Comeback round: nobody brought back', 'phase');
+  }
+  /** A person's comeback picks (up to 3 of the unsold candidates; an empty list is allowed). */
+  function comebackPick(game, side, ids) {
+    var cb = game.comeback;
+    if (game.phase !== 'comeback' || !cb || cb.picks[side] !== null) return { ok: false, reason: 'No comeback pick is due' };
+    ids = (ids || []).filter(function (id, i, a) { return a.indexOf(id) === i; });
+    if (ids.length > cb.max) return { ok: false, reason: 'Pick up to ' + cb.max };
+    if (ids.some(function (id) { return cb.options.indexOf(id) < 0; })) return { ok: false, reason: 'Only unsold candidates can come back' };
+    cb.picks[side] = ids;
+    if (game.actions) game.actions.push({ k: 'c', s: side, ids: ids.slice() });
+    event(game, side, label(side, game) + ' ' + verb(game, side, 'bring', 'brings') + ' back ' + (ids.length ? ids.map(function (id) { return C(game, id).name; }).join(', ') : 'nobody'), 'info');
+    if (cb.picks.human !== null && cb.picks.ai !== null) { buildComeback(game); step(game); }
+    return { ok: true };
   }
 
   /** After any action: does the lot end now? Returns the result or null. */
@@ -970,7 +1052,7 @@
     } else {
       if (lot.kind === 'star') game.withdrawnStars.push(lot.id);
       else if (lot.phase === 'main' && game.unsold.indexOf(lot.id) < 0) game.unsold.push(lot.id);
-      event(game, null, 'Unsold – ' + (lot.kind === 'star' ? 'star withdrawn' : lot.phase === 'main' ? 'goes to last call' : 'no takers'), 'unsold');
+      event(game, null, 'Unsold – ' + (lot.kind === 'star' ? 'star withdrawn' : lot.phase === 'main' ? 'can come back in the comeback round' : 'no takers'), 'unsold');
     }
     game.log.push(entry);
     game.lastResult = entry;
@@ -980,8 +1062,11 @@
   /** Last resort so every game finishes: teams with open seats claim the best affordable remaining regulars. */
   function forceFill(game) {
     var S = game.data.settings;
-    var pool = game.data.candidates.filter(function (c) { return !c.isStar && !game.sold[c.id]; })
-      .sort(function (a, b) { return b.capability - a.capability; });
+    // first the people offered in this auction (the shortlist), so an empty seat is never filled from an unrelated industry
+    var offered = {}; game.queue.forEach(function (q) { offered[q.id] = 1; });
+    var byFit = function (a, b) { var fa = game.challenge ? (a.fit[game.challenge] || 0) : a.capability, fb = game.challenge ? (b.fit[game.challenge] || 0) : b.capability; return fb - fa || (a.id < b.id ? -1 : 1); };
+    var pool = game.data.candidates.filter(function (c) { return !c.isStar && !game.sold[c.id] && offered[c.id]; }).sort(byFit)
+      .concat(game.data.candidates.filter(function (c) { return !c.isStar && !game.sold[c.id] && !offered[c.id]; }).sort(byFit));
     var guard = 0;
     while ((openSeats(game, 'human') > 0 || openSeats(game, 'ai') > 0) && guard++ < 20) {
       var side = openSeats(game, 'human') >= openSeats(game, 'ai') ? 'human' : 'ai';
@@ -1025,7 +1110,7 @@
     return { ok: true };
   }
 
-  return { setCaptain: setCaptain, createGame: createGame, canBid: canBid, eligible: eligible, nextPrice: nextPrice, increment: increment,
+  return { comebackPick: comebackPick, comebackOptions: comebackOptions, aiComebackPicks: aiComebackPicks, setCaptain: setCaptain, createGame: createGame, canBid: canBid, eligible: eligible, nextPrice: nextPrice, increment: increment,
     bid: bid, pass: pass, timeout: timeout, advance: advance, openSeats: openSeats, fnCount: fnCount,
     starCount: starCount, scoreBoth: scoreBoth, other: other, label: label, MODES: MODES };
 });
@@ -1067,12 +1152,28 @@
     passive: function () { return false; }  // never bids: exercises last call + forced fill
   };
 
+
+  /** Scripted comeback picks for a person-controlled side: the best-fitting unsold candidates it may still sign and afford. */
+  function scriptedComeback(game, side, styleName) {
+    if (styleName === 'passive') return [];
+    var t = game.teams[side], S = game.data.settings, open = A.openSeats(game, side), rid = game.challenge;
+    var opts = A.comebackOptions(game).filter(function (id) { var c = C(game, id); return A.eligible(game, side, id).ok && t.purse - c.startingBid >= (open - 1) * S.reserveFloor; });
+    opts.sort(function (a, b) { return (C(game, b).fit[rid] || 0) - (C(game, a).fit[rid] || 0) || (a < b ? -1 : 1); });
+    return opts.slice(0, game.comeback.max);
+  }
+  function comebackStep(game, styleFor) {
+    if (game.phase !== 'comeback' || game.lot) return false;
+    ['human', 'ai'].forEach(function (sd) { if (game.comeback.picks[sd] === null) A.comebackPick(game, sd, scriptedComeback(game, sd, styleFor(sd))); });
+    return true;
+  }
+
   function playGame(data, seed, styleName, challenge) {
     var style = STRATEGIES[styleName] || STRATEGIES.balanced;
     var hr = RNG.make(seed + ':human');
     var game = A.createGame(data, seed, challenge ? { challenge: challenge } : null), steps = 0;
     game._style = styleName;
     while (!game.done && steps++ < 5000) {
+      if (comebackStep(game, function () { return styleName; })) continue;
       var lot = game.lot;
       // opening: whoever wants it; if both, a coin flip decides who got there first
       var h = style(game, hr), a = AI.decide(game, A);
@@ -1129,6 +1230,7 @@
       return c.isStar ? cb.price <= c.benchmark * 0.95 : cb.price <= c.benchmark * (fresh ? 1.0 : 0.85);
     }
     while (!game.done && steps++ < 5000) {
+      if (comebackStep(game, function (sd) { return styles[sd] || 'balanced'; })) continue;
       var lot = game.lot, h = move('human'), a = move('ai'), first = null;
       if (h.action === 'bid' && a.action === 'bid') first = game.aiRng.next() < 0.5 ? 'human' : 'ai';
       else if (h.action === 'bid') first = 'human'; else if (a.action === 'bid') first = 'ai';
@@ -1199,7 +1301,7 @@
     return out;
   }
 
-  return { STRATEGIES: STRATEGIES, playGame: playGame, playMatch: playMatch, runModes: runModes, checkGame: checkGame, runMany: runMany };
+  return { scriptedComeback: scriptedComeback, comebackStep: comebackStep, STRATEGIES: STRATEGIES, playGame: playGame, playMatch: playMatch, runModes: runModes, checkGame: checkGame, runMany: runMany };
 });
 
 /* ---- src/debrief.js ---- */
@@ -2144,6 +2246,7 @@
     return { v: 1, app: appVersion || '', data: game.data.meta && game.data.meta.generatedAt, mode: game.mode, problem: game.challenge, seed: game.seed,
       actions: (game.actions || []).map(function (a) { return a.k + (a.s ? (a.s === 'human' ? 'h' : 'a') : ''); }).join(''),
       captain: game.captain ? game.captain.human : null, transfer: tr ? { out: tr.out, in: tr.in } : null,
+      comeback: game.comeback && game.comeback.picks && game.comeback.picks.human && game.actions && game.actions.some(function (a) { return a.k === 'c'; }) ? game.comeback.picks.human.slice() : null,
       final: Math.round(sc.human.final * 1000) / 1000 };
   }
 
@@ -2158,13 +2261,18 @@
     if (!rd) return fail('Unknown problem');
     if (typeof rec.seed !== 'string' || !/^[A-Z0-9-]{1,24}$/.test(rec.seed)) return fail('Bad seed');
     var acts = String(rec.actions || '');
-    if (!/^(a|t|bh|ba|ph|pa)*$/.test(acts) || acts.length > LIMITS.maxActions * 2) return fail('Bad move list');
-    var moves = acts.match(/a|t|bh|ba|ph|pa/g) || [];
+    if (!/^(a|t|bh|ba|ph|pa|ch)*$/.test(acts) || acts.length > LIMITS.maxActions * 2) return fail('Bad move list');
+    var moves = acts.match(/ch|a|t|bh|ba|ph|pa/g) || [];
     var g = A.createGame(data, rec.seed, { challenge: rec.problem, mode: 'hva' });
     g.actions = null;   // replaying, not recording
     for (var i = 0; i < moves.length; i++) {
       var m = moves[i], k = m[0], side = m[1] === 'h' ? 'human' : 'ai';
       if (k === 'a') { if (g.done) return fail('Move after the end (' + i + ')'); A.advance(g); continue; }
+      if (k === 'c') {
+        if (side !== 'human' || !Array.isArray(rec.comeback) || rec.comeback.length > 3 || rec.comeback.some(function (id) { return typeof id !== 'string'; })) return fail('Bad comeback picks');
+        if (!A.comebackPick(g, 'human', rec.comeback).ok) return fail('Those comeback picks were not possible (move ' + i + ')');
+        continue;
+      }
       var lot = g.lot;
       if (g.done || !lot || lot.closed) return fail('No open lot at move ' + i);
       if (k === 't') {
